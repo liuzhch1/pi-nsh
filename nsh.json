@@ -1,0 +1,28 @@
+{
+  "name": "Pi",
+  "id": "dev.pi.nsh",
+  "version": "0.1.0",
+  "build": 1,
+  "appearance": "system",
+  "theme": "theme.json",
+  "window": {
+    "title": "Pi",
+    "defaultSize": { "width": 1180, "height": 820 },
+    "minSize": { "width": 900, "height": 600 }
+  },
+  "capabilities": {
+    "homeDir": true,
+    "fs": {
+      "read": ["${homeDir}"],
+      "write": ["${homeDir}"]
+    },
+    "process": {
+      "execute": ["/bin/zsh", "osascript"]
+    },
+    "statusBar": true,
+    "clipboard": true,
+    "openUrl": {
+      "schemes": ["https", "http"]
+    }
+  }
+}
