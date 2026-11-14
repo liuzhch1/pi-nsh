@@ -209,6 +209,7 @@ function applyAssistantDelta(blocks: ContentBlock[], event: Record<string, unkno
 function App() {
   const projects = signal<ProjectInfo[]>([]);
   const sessions = signal<Record<string, SessionInfo[]>>({});
+  const sidebarOpen = signal(true);
   const expandedProjects = signal<Set<string>>(new Set());
   const showAllSessions = signal<Set<string>>(new Set());
   const activeProject = signal<string | null>(null);
@@ -760,6 +761,8 @@ function App() {
     }),
   );
 
+  cleanup(keymap.bind("mod+b", () => sidebarOpen.set(!sidebarOpen()), { when: "always" }));
+
   function ProjectRow(props: { project: () => ProjectInfo }) {
     const project = props.project;
     const projectPath = computed(() => project().path);
@@ -967,10 +970,20 @@ function App() {
           backgroundColor: colors.background,
           flexDirection: "row",
           alignItems: "center",
-          paddingHorizontal: 22,
+          paddingLeft: 14,
+          paddingRight: 22,
           gap: 10,
         }}
       >
+        <Press
+          onPress={() => sidebarOpen.set(!sidebarOpen())}
+          hoverStyle={{ backgroundColor: colors.accent }}
+          style={{ width: 28, height: 28, borderRadius: 7, alignItems: "center", justifyContent: "center" }}
+          accessibilityLabel={sidebarOpen() ? "Hide sidebar" : "Show sidebar"}
+          accessibilityState={{ expanded: sidebarOpen() }}
+        >
+          <Icon name="panel-left" size={16} tint={colors.mutedText} />
+        </Press>
         <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 7 }}>
           <Text style={{ numberOfLines: 1, fontSize: 13, fontWeight: "600", color: colors.text }}>{project()?.name ?? "Pi"}</Text>
           <If when={Boolean(session())}>
@@ -1608,7 +1621,9 @@ function App() {
         paddingLeft: "env(safe-area-inset-left)",
       }}
     >
-      <Sidebar />
+      <If when={sidebarOpen()}>
+        <Sidebar />
+      </If>
       <View style={{ flex: 1, minWidth: 0, minHeight: 0 }}>
         <Header />
         <View style={{ flex: 1, minHeight: 0 }}>
