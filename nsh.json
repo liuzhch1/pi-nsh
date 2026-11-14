@@ -17,7 +17,8 @@
       "write": ["${homeDir}"]
     },
     "process": {
-      "execute": ["/bin/zsh", "osascript"]
+      "execute": ["pi", "env", "osascript"],
+      "env": ["FNM_DIR", "NVM_DIR", "BUN_INSTALL", "NPM_CONFIG_PREFIX"]
     },
     "statusBar": true,
     "clipboard": true,

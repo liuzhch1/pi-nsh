@@ -6,7 +6,7 @@ A small native desktop UI for the [pi coding agent](https://github.com/earendil-
 
 - macOS
 - `nsh` 0.5.1 or newer
-- `pi` on the login shell's `PATH` (this app drives `pi --mode rpc`)
+- `pi` installed for the current user; the app checks `PATH`, npm, nvm, fnm, bun, pnpm, mise, and Homebrew locations (it drives `pi --mode rpc`)
 
 ## Run
 
@@ -41,4 +41,4 @@ Projects are stored by the nsh app under its own app storage. Removing a project
 - `ui.tsx` — theme tokens and shared primitives
 - `theme.json` — grayscale light/dark palette
 
-The app asks for read/write access under the home folder because pi runs with the selected project as its working directory. Process execution is limited to the login shell and `osascript` (the folder chooser).
+The app asks for read/write access under the home folder because pi runs with the selected project as its working directory. Process execution is limited to `pi`, `env` (to launch a resolved pi with its tool paths), and `osascript` (the folder chooser).

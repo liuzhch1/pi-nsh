@@ -57,6 +57,8 @@ type ClientOptions = {
 };
 
 const SESSION_VERSION_ROOT = path.join(os.homedir(), ".pi", "agent", "sessions");
+type PiResolution = { executable: string; pathValue: string };
+let piResolutionPromise: Promise<PiResolution> | null = null;
 
 function projectName(value: string): string {
   const trimmed = value.replace(/[\\/]+$/, "");
@@ -72,6 +74,138 @@ function projectSessionDir(projectPath: string): string {
   const trimmed = projectPath.replace(/[\\/]+$/, "");
   const flat = trimmed.replace(/^[\\/]+/, "").replace(/[\\/:]/g, "-");
   return path.join(SESSION_VERSION_ROOT, `--${flat}--`);
+}
+
+function uniqueDirs(values: string[]): string[] {
+  const seen = new Set<string>();
+  const dirs: string[] = [];
+  for (const value of values) {
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    dirs.push(value);
+  }
+  return dirs;
+}
+
+function nodeVersionParts(value: string): number[] {
+  const parts = value.replace(/^v/, "").split(".").slice(0, 3).map((part) => Number.parseInt(part, 10));
+  return parts.every(Number.isFinite) ? parts : [];
+}
+
+function compareNodeVersionsDescending(a: string, b: string): number {
+  const left = nodeVersionParts(a);
+  const right = nodeVersionParts(b);
+  for (let index = 0; index < 3; index++) {
+    const difference = (right[index] ?? 0) - (left[index] ?? 0);
+    if (difference) return difference;
+  }
+  return b.localeCompare(a);
+}
+
+async function versionBinDirs(root: string, suffix: string): Promise<string[]> {
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort(compareNodeVersionsDescending)
+      .map((name) => path.join(root, name, suffix));
+  } catch {
+    return [];
+  }
+}
+
+async function npmPrefixDir(home: string): Promise<string | null> {
+  const configured = process.env.NPM_CONFIG_PREFIX;
+  if (configured && path.isAbsolute(configured)) return configured;
+  try {
+    const text = await fs.readFile(path.join(home, ".npmrc"), "utf8");
+    for (const line of text.split("\n")) {
+      const [key, ...rest] = line.split("=");
+      if (key?.trim() !== "prefix") continue;
+      let value = rest.join("=").trim().replace(/^['"]|['"]$/g, "");
+      if (value.startsWith("~/")) value = path.join(home, value.slice(2));
+      if (path.isAbsolute(value)) return value;
+    }
+  } catch {}
+  return null;
+}
+
+async function piCandidateDirs(): Promise<string[]> {
+  const home = os.homedir();
+  const bunRoot = process.env.BUN_INSTALL;
+  const dirs = [
+    ...(process.env.PATH ?? "").split(path.delimiter),
+    path.join(home, "bin"),
+    path.join(home, ".local", "bin"),
+    path.join(home, ".npm-global", "bin"),
+    path.join(home, ".npm", "bin"),
+    bunRoot && path.isAbsolute(bunRoot) ? path.join(bunRoot, "bin") : path.join(home, ".bun", "bin"),
+    path.join(home, ".volta", "bin"),
+    path.join(home, ".asdf", "shims"),
+    path.join(home, ".local", "share", "mise", "shims"),
+    path.join(home, ".local", "share", "pnpm"),
+    path.join(home, "Library", "pnpm"),
+    path.join(home, ".cargo", "bin"),
+    path.join(home, ".deno", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ];
+
+  const prefix = await npmPrefixDir(home);
+  if (prefix) dirs.push(path.join(prefix, "bin"));
+
+  const fnmRoots = uniqueDirs([
+    process.env.FNM_DIR ?? "",
+    path.join(home, ".local", "share", "fnm"),
+    path.join(home, "Library", "Application Support", "fnm"),
+  ]);
+  for (const root of fnmRoots) {
+    dirs.push(path.join(root, "aliases", "default", "bin"));
+    dirs.push(...(await versionBinDirs(path.join(root, "node-versions"), path.join("installation", "bin"))));
+  }
+
+  const nvmRoots = uniqueDirs([process.env.NVM_DIR ?? "", path.join(home, ".nvm")]);
+  for (const root of nvmRoots) {
+    dirs.push(...(await versionBinDirs(path.join(root, "versions", "node"), "bin")));
+  }
+
+  dirs.push(...(await versionBinDirs(path.join(home, ".local", "share", "mise", "installs", "node"), "bin")));
+  return uniqueDirs(dirs);
+}
+
+async function isExecutableFile(filePath: string): Promise<boolean> {
+  try {
+    const stats = await fs.stat(filePath);
+    return stats.isFile() && (process.platform === "windows" || (stats.mode & 0o111) !== 0);
+  } catch {
+    return false;
+  }
+}
+
+async function resolvePi(): Promise<PiResolution> {
+  const names = process.platform === "windows" ? ["pi.exe", "pi.cmd"] : ["pi"];
+  const dirs = await piCandidateDirs();
+  for (const dir of dirs) {
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (await isExecutableFile(candidate)) return { executable: candidate, pathValue: dirs.join(path.delimiter) };
+    }
+  }
+  throw new Error("pi was not found. Install pi or make its executable folder available to the app.");
+}
+
+function resolvedPi(): Promise<PiResolution> {
+  if (!piResolutionPromise) {
+    piResolutionPromise = resolvePi().then(
+      (resolution) => resolution,
+      (reason) => {
+        piResolutionPromise = null;
+        throw reason;
+      },
+    );
+  }
+  return piResolutionPromise;
 }
 
 function cleanTitle(value: string): string {
@@ -233,7 +367,7 @@ export class PiClient {
     this.options = options;
   }
 
-  start(): void {
+  async start(): Promise<void> {
     if (this.child) return;
     if (process.platform === "web") {
       throw new Error("pi can only run in the native app");
@@ -242,11 +376,19 @@ export class PiClient {
     if (this.options.noSession) args.push("--no-session");
     else if (this.options.sessionPath) args.push("--session", this.options.sessionPath);
 
-    const child = process.spawn("/bin/zsh", ["-lc", 'exec pi "$@"', "pi-nsh", ...args], {
+    const spawnOptions = {
       cwd: this.options.projectPath,
       stdin: "pipe",
       lines: true,
-    });
+    } as const;
+    let child: ReturnType<typeof process.spawn>;
+    try {
+      child = process.spawn("pi", args, spawnOptions);
+    } catch (reason) {
+      if ((reason as { code?: string }).code !== "ENOENT") throw reason;
+      const resolution = await resolvedPi();
+      child = process.spawn("env", [`PATH=${resolution.pathValue}`, resolution.executable, ...args], spawnOptions);
+    }
     this.child = child;
 
     child.on("stdout", (line) => this.consume(line));
@@ -333,7 +475,7 @@ export async function loadCatalog(): Promise<{ models: ModelInfo[]; defaultModel
     onEvent: () => {},
   });
   try {
-    client.start();
+    await client.start();
     const state = await client.request<{ model?: ModelInfo }>("get_state");
     const available = await client.request<{ models?: ModelInfo[] }>("get_available_models");
     const models = Array.isArray(available?.models) ? available.models : [];

@@ -485,7 +485,7 @@ function App() {
     inputHeight.set(22);
   };
 
-  const startClient = (projectPath: string, sessionPath: string | null, generation: number): PiClient => {
+  const startClient = async (projectPath: string, sessionPath: string | null, generation: number): Promise<PiClient> => {
     lastStderr = "";
     const next = new PiClient({
       projectPath,
@@ -502,7 +502,7 @@ function App() {
         error.set(lastStderr || "pi stopped unexpectedly.");
       },
     });
-    next.start();
+    await next.start();
     client = next;
     return next;
   };
@@ -520,7 +520,7 @@ function App() {
     modelChosen.set(false);
     loading.set(true);
     try {
-      const started = startClient(projectPath, sessionPath, generation);
+      const started = await startClient(projectPath, sessionPath, generation);
       const state = await started.request<{ model?: ModelInfo }>("get_state");
       if (generation !== clientGeneration) return;
       applyModel(state?.model);
@@ -568,7 +568,7 @@ function App() {
       if (!client) {
         const generation = ++clientGeneration;
         loading.set(true);
-        const started = startClient(projectPath, activeSession(), generation);
+        const started = await startClient(projectPath, activeSession(), generation);
         const state = await started.request<{ sessionFile?: string; model?: ModelInfo }>("get_state");
         if (generation !== clientGeneration) return;
         if (state?.sessionFile && !activeSession()) {
