@@ -1,4 +1,4 @@
-import { token, type Tokens, View, type ViewStyle } from "nsh";
+import { Canvas, token, type Tokens, View, type ViewStyle } from "nsh";
 import type { JSX } from "nsh";
 
 function colorsFrom<K extends string>(names: Record<K, keyof Tokens>): Record<K, string> {
@@ -79,16 +79,34 @@ export function Press(props: {
 
 export function Spinner(props: { size?: number; tint?: string }) {
   const size = props.size ?? 12;
+  const stroke = Math.max(1.5, size * 0.12);
   return (
-    <View
+    <Canvas
       class="animate-spin"
-      style={{
-        width: size,
-        height: size,
-        borderRadius: size / 2,
-        borderWidth: Math.max(1.2, size / 10),
-        borderColor: props.tint ?? colors.mutedText,
-        borderTopColor: "transparent",
+      style={{ width: size, height: size, pointerEvents: "none" }}
+      draw={(cx, { width }) => {
+        cx.clearRect(0, 0, width, width);
+        cx.strokeStyle = props.tint ?? colors.mutedText;
+        cx.lineWidth = stroke;
+        const center = width / 2;
+        const radius = (width - stroke) / 2;
+        const segments = 14;
+        const sweep = Math.PI * 1.45;
+        const step = sweep / segments;
+        cx.lineCap = "butt";
+        cx.globalAlpha = 0.16;
+        cx.beginPath();
+        cx.arc(center, center, radius, 0, Math.PI * 2);
+        cx.stroke();
+        for (let index = 0; index < segments; index++) {
+          const tail = (index + 1) / segments;
+          cx.globalAlpha = 0.3 + tail * 0.7;
+          const start = -Math.PI / 2 + index * step;
+          cx.beginPath();
+          cx.arc(center, center, radius, start, start + step * 1.15);
+          cx.stroke();
+        }
+        cx.globalAlpha = 1;
       }}
     />
   );

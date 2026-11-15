@@ -9,6 +9,7 @@ import {
   openUrl,
   Scroll,
   signal,
+  type Signal,
   Storage,
   Text,
   type InputRef,
@@ -22,8 +23,10 @@ import path from "path";
 import process from "process";
 import { Icon } from "./icons";
 import {
+  cleanSessionTitle,
   discoverProjects,
   loadCatalog,
+  loadSessionHistory,
   type ContentBlock,
   type ModelInfo,
   type PiEvent,
@@ -33,11 +36,13 @@ import {
   type ProjectInfo,
   scanAllProjects,
   scanProjectSessions,
+  seedSessionCache,
   type SessionInfo,
 } from "./pi";
 import { colors, content as contentMetrics, Press, roundButtonStyle, sidebar as sidebarMetrics, Spinner } from "./ui";
 
-const PROJECTS_KEY = "pi-nsh.projects.v1";
+const PROJECTS_KEY = "pi-nsh.projects.v2";
+const SESSIONS_KEY = "pi-nsh.sessions.v1";
 const VISIBLE_SESSIONS = 5;
 
 type ToolRun = {
@@ -48,6 +53,82 @@ type ToolRun = {
   durationMs?: number;
 };
 
+type ChatState = {
+  messages: PiMessage[];
+  toolRuns: Record<string, ToolRun>;
+  collapsed: Set<string>;
+  expandedBlocks: Set<string>;
+  running: boolean;
+  loading: boolean;
+  status: string | null;
+  error: string | null;
+  liveId: string | null;
+  visibleCount: number;
+};
+
+type ChatSession = {
+  id: string;
+  path: string | null;
+  projectPath: string | null;
+  version: Signal<number>;
+  state: ChatState;
+  client: PiClient | null;
+  clientReady: Promise<PiClient> | null;
+  generation: number;
+  loadToken: number;
+  lastUsed: number;
+  loaded: boolean;
+  loadedAt: number;
+  mtimeMs: number;
+  size: number;
+  pendingUserId: string | null;
+  liveAssistantId: string | null;
+  openMessageId: string | null;
+  modelKey: string | null;
+  modelChosen: boolean;
+};
+
+const PAGE_SIZE = 50;
+const MAX_CHATS = 8;
+const MAX_LIVE_CLIENTS = 3;
+const CHAT_CACHE_TTL_MS = 10 * 60_000;
+const CLIENT_IDLE_MS = 10 * 60_000;
+
+function createChatSession(id: string, projectPath: string | null, path: string | null): ChatSession {
+  return {
+    id,
+    path,
+    projectPath,
+    version: signal(0),
+    state: {
+      messages: [],
+      toolRuns: {},
+      collapsed: new Set(),
+      expandedBlocks: new Set(),
+      running: false,
+      loading: false,
+      status: null,
+      error: null,
+      liveId: null,
+      visibleCount: PAGE_SIZE,
+    },
+    client: null,
+    clientReady: null,
+    generation: 0,
+    loadToken: 0,
+    lastUsed: 0,
+    loaded: false,
+    loadedAt: 0,
+    mtimeMs: 0,
+    size: 0,
+    pendingUserId: null,
+    liveAssistantId: null,
+    openMessageId: null,
+    modelKey: null,
+    modelChosen: false,
+  };
+}
+
 let messageSequence = 0;
 
 function newMessageId(prefix: string): string {
@@ -56,6 +137,13 @@ function newMessageId(prefix: string): string {
 
 function modelKeyOf(model: Pick<ModelInfo, "provider" | "id">): string {
   return `${model.provider}/${model.id}`;
+}
+
+function modelMatchesKey(model: ModelInfo, key: string | null): boolean {
+  if (!key) return false;
+  if (modelKeyOf(model) === key) return true;
+  // A resumed session can name an older provider alias for a catalog model.
+  return model.id === key.slice(key.indexOf("/") + 1);
 }
 
 function textOfContent(content: unknown): string {
@@ -142,6 +230,14 @@ function workBlocksOf(turnKey: string, messages: PiMessage[]): WorkBlock[] {
   return blocks;
 }
 
+function collapsedTurnsOf(messages: PiMessage[]): Set<string> {
+  const keys = new Set<string>();
+  for (const item of buildTimeline(messages)) {
+    if (item.kind === "turn" && item.messages.some((message) => hasWork(message))) keys.add(item.key);
+  }
+  return keys;
+}
+
 function oneLine(value: string, limit = 120): string {
   const text = value.replace(/\s+/g, " ").trim();
   return text.length > limit ? `${text.slice(0, limit - 1).trimEnd()}…` : text;
@@ -214,41 +310,64 @@ function App() {
   const showAllSessions = signal<Set<string>>(new Set());
   const activeProject = signal<string | null>(null);
   const activeSession = signal<string | null>(null);
-  const messages = signal<PiMessage[]>([]);
-  const toolRuns = signal<Record<string, ToolRun>>({});
-  const collapsed = signal<Set<string>>(new Set());
-  const expandedBlocks = signal<Set<string>>(new Set());
-  const running = signal(false);
-  const loading = signal(false);
+  const draftChatId = signal<string | null>(null);
   const booted = signal(false);
-  const error = signal<string | null>(null);
-  const status = signal<string | null>(null);
   const draft = signal("");
   const inputHeight = signal(22);
   const models = signal<ModelInfo[]>([]);
   const modelKey = signal<string | null>(null);
   const modelChosen = signal(false);
   const modelOpen = signal(false);
-  const liveId = signal<string | null>(null);
   const addOpen = signal(false);
   const addPath = signal("");
   const addError = signal<string | null>(null);
   const picking = signal(false);
   const piIssue = signal<string | null>(null);
+  const appError = signal<string | null>(null);
+  const chatActivity = signal(0);
 
-  let client: PiClient | null = null;
-  let clientGeneration = 0;
-  let pendingUserId: string | null = null;
-  let liveAssistantId: string | null = null;
-  let openMessageId: string | null = null;
   let composerInput: InputRef | undefined;
   let addCardRef: ViewRef | undefined;
-  let lastStderr = "";
+  let catalogLoading: Promise<void> | null = null;
+
+  let draftSequence = 0;
+  const chats = new Map<string, ChatSession>();
+  const blankChat = createChatSession("", null, null);
+
+  const activeChat = (): ChatSession => {
+    const id = activeSession() ?? draftChatId();
+    if (!id) return blankChat;
+    return chats.get(id) ?? blankChat;
+  };
+
+  const chatView = () => {
+    const chat = activeChat();
+    chat.version();
+    return chat.state;
+  };
+
+  const setChatState = (chat: ChatSession, patch: Partial<ChatState>) => {
+    if (chat === blankChat) return;
+    Object.assign(chat.state, patch);
+    chat.version.update((value) => value + 1);
+    if (patch.running !== undefined || patch.error !== undefined) chatActivity.update((value) => value + 1);
+  };
+
+  const messages = computed(() => chatView().messages);
+  const toolRuns = computed(() => chatView().toolRuns);
+  const collapsed = computed(() => chatView().collapsed);
+  const expandedBlocks = computed(() => chatView().expandedBlocks);
+  const running = computed(() => chatView().running);
+  const loading = computed(() => chatView().loading);
+  const status = computed(() => chatView().status);
+  const error = computed(() => chatView().error ?? appError());
+  const liveId = computed(() => chatView().liveId);
+  const chatOpen = computed(() => Boolean(activeSession()) || chatView().messages.length > 0);
 
   const currentModel = computed(() => {
     const key = modelKey();
     if (!key) return models()[0] ?? null;
-    return models().find((model) => modelKeyOf(model) === key) ?? null;
+    return models().find((model) => modelMatchesKey(model, key)) ?? null;
   });
 
   const modelGroups = computed(() => {
@@ -280,6 +399,14 @@ function App() {
 
   const displayItems = computed(() => buildTimeline(messages()));
 
+  const visibleItems = computed(() => {
+    const items = displayItems();
+    const count = chatView().visibleCount;
+    return count >= items.length ? items : items.slice(items.length - count);
+  });
+
+  const hasEarlier = computed(() => displayItems().length > chatView().visibleCount);
+
   const activeProjectInfo = computed(() => projects().find((project) => project.path === activeProject()) ?? null);
   const activeSessionInfo = computed(() => {
     const project = activeProject();
@@ -292,28 +419,33 @@ function App() {
     try {
       await Storage.setItem(PROJECTS_KEY, JSON.stringify(list));
     } catch (reason) {
-      error.set(`Could not save projects: ${errorText(reason)}`);
+      appError.set(`Could not save projects: ${errorText(reason)}`);
     }
   };
 
-  const applyModel = (model: ModelInfo | null | undefined) => {
+  const applyModel = (model: ModelInfo | null | undefined, chat: ChatSession | null = null) => {
     if (!model?.provider || !model.id) return;
     const key = modelKeyOf(model);
-    modelKey.set(key);
     models.update((list) => (list.some((item) => modelKeyOf(item) === key) ? list : [...list, model]));
+    if (chat) chat.modelKey = key;
+    if (!chat || chat === activeChat()) modelKey.set(key);
   };
 
-  const collapseAllWork = () => {
-    const keys = buildTimeline(messages())
+  const collapseAllWork = (chat = activeChat()) => {
+    if (chat === blankChat) return;
+    const keys = buildTimeline(chat.state.messages)
       .filter((item): item is TurnDisplay => item.kind === "turn" && item.messages.some((message) => hasWork(message)))
       .map((item) => item.key);
     if (!keys.length) return;
-    collapsed.update((set) => {
-      const next = new Set(set);
-      for (const key of keys) next.add(key);
-      return next;
-    });
-    expandedBlocks.set(new Set());
+    const next = new Set(chat.state.collapsed);
+    for (const key of keys) next.add(key);
+    setChatState(chat, { collapsed: next, expandedBlocks: new Set() });
+  };
+
+  const showEarlier = () => {
+    const chat = activeChat();
+    if (chat === blankChat) return;
+    setChatState(chat, { visibleCount: chat.state.visibleCount + PAGE_SIZE });
   };
 
   const refreshProject = async (projectPath: string) => {
@@ -325,40 +457,167 @@ function App() {
     }
   };
 
-  const handleEvent = (event: PiEvent, generation: number) => {
-    if (generation !== clientGeneration) return;
+  // pi appends the finished turn before `agent_settled`, so the sidebar can move
+  // the chat up without reading its session file again.
+  const bumpSession = (chat: ChatSession) => {
+    const projectPath = chat.projectPath;
+    const sessionPath = chat.path;
+    if (!projectPath || !sessionPath) return;
+    const list = sessions()[projectPath] ?? [];
+    const existing = list.find((item) => item.path === sessionPath);
+    // A new chat gets its title from the first user message, which pi writes
+    // after the first prompt; rescan just that once.
+    if (!existing || existing.title === "New chat") {
+      void refreshProject(projectPath);
+      return;
+    }
+    sessions.update((current) => ({
+      ...current,
+      [projectPath]: [{ ...existing, modified: Date.now() }, ...list.filter((item) => item.path !== sessionPath)],
+    }));
+  };
+
+  const trimChatStates = () => {
+    const loaded = [...chats.values()].filter((chat) => chat.state.messages.length > 0);
+    if (loaded.length <= MAX_CHATS) return;
+    const active = activeChat();
+    loaded.sort((a, b) => a.lastUsed - b.lastUsed);
+    let excess = loaded.length - MAX_CHATS;
+    for (const chat of loaded) {
+      if (excess <= 0) break;
+      if (chat === active || chat.state.running || chat.client || chat.clientReady) continue;
+      chat.loaded = false;
+      setChatState(chat, {
+        messages: [],
+        toolRuns: {},
+        collapsed: new Set(),
+        expandedBlocks: new Set(),
+        visibleCount: PAGE_SIZE,
+        error: null,
+        status: null,
+        liveId: null,
+      });
+      excess--;
+    }
+  };
+
+  const loadHistoryFromPi = async (chat: ChatSession, token?: number) => {
+    if (!chat.projectPath) return;
+    try {
+      const started = chat.client ?? (await ensureClient(chat));
+      const [state, data] = await Promise.all([
+        started.request<{ model?: ModelInfo }>("get_state"),
+        started.request<{ messages?: PiMessage[] }>("get_messages"),
+      ]);
+      if (token !== undefined && token !== chat.loadToken) return;
+      applyModel(state?.model, chat);
+      const history = (data?.messages ?? []).map((message, index) => ({ ...message, id: `history-${index}-${message.timestamp ?? 0}` }));
+      setChatState(chat, {
+        messages: history,
+        collapsed: collapsedTurnsOf(history),
+        toolRuns: {},
+        expandedBlocks: new Set(),
+        loading: false,
+      });
+      chat.loaded = true;
+      chat.loadedAt = Date.now();
+    } catch (reason) {
+      if (token !== undefined && token !== chat.loadToken) return;
+      setChatState(chat, { error: errorText(reason), loading: false });
+    }
+  };
+
+  const loadChat = async (chat: ChatSession, options: { background?: boolean } = {}) => {
+    if (!chat.path || chat.client || chat.clientReady) return;
+    const token = ++chat.loadToken;
+    if (!options.background || chat.state.messages.length === 0) setChatState(chat, { loading: true });
+    try {
+      const history = await loadSessionHistory(chat.path);
+      if (token !== chat.loadToken) return;
+      const firstLoad = !chat.loaded;
+      setChatState(chat, {
+        messages: history.messages,
+        toolRuns: {},
+        collapsed: collapsedTurnsOf(history.messages),
+        expandedBlocks: new Set(),
+        loading: false,
+        ...(firstLoad ? { visibleCount: PAGE_SIZE } : {}),
+      });
+      chat.loaded = true;
+      chat.loadedAt = Date.now();
+      chat.mtimeMs = history.mtimeMs;
+      chat.size = history.size;
+      if (!chat.modelKey && history.model) {
+        const key = `${history.model.provider}/${history.model.id}`;
+        chat.modelKey = key;
+        if (chat === activeChat()) modelKey.set(key);
+      }
+      trimChatStates();
+    } catch {
+      if (token !== chat.loadToken) return;
+      await loadHistoryFromPi(chat, token);
+    }
+  };
+
+  const revalidateChat = async (chat: ChatSession) => {
+    if (!chat.path || chat.client || chat.clientReady) return;
+    try {
+      const stats = await fs.stat(chat.path);
+      const expired = Date.now() - chat.loadedAt > CHAT_CACHE_TTL_MS;
+      if (expired || stats.mtimeMs !== chat.mtimeMs || stats.size !== chat.size) await loadChat(chat, { background: true });
+    } catch {
+      // Keep the cached transcript until the file can be read again.
+    }
+  };
+
+  const ensureChat = (id: string, projectPath: string | null, path: string | null): ChatSession => {
+    let chat = chats.get(id);
+    if (!chat) {
+      chat = createChatSession(id, projectPath, path);
+      chats.set(id, chat);
+    } else {
+      if (projectPath) chat.projectPath = projectPath;
+      if (path) chat.path = path;
+    }
+    return chat;
+  };
+
+  const handleEvent = (event: PiEvent, chat: ChatSession, generation: number) => {
+    if (generation !== chat.generation) return;
+    chat.lastUsed = Date.now();
+    const set = (patch: Partial<ChatState>) => setChatState(chat, patch);
+    const updateMessages = (fn: (list: PiMessage[]) => PiMessage[]) => set({ messages: fn(chat.state.messages) });
 
     switch (event.type) {
       case "agent_start":
       case "turn_start": {
-        running.set(true);
-        status.set(null);
+        set({ running: true, status: null });
         break;
       }
       case "message_start": {
         const raw = event.message as PiMessage | undefined;
         if (!raw) break;
-        if (raw.role === "user" && pendingUserId) {
-          const id = pendingUserId;
-          openMessageId = id;
-          messages.update((list) => list.map((message) => (message.id === id ? { ...raw, id } : message)));
-          pendingUserId = null;
+        if (raw.role === "user" && chat.pendingUserId) {
+          const id = chat.pendingUserId;
+          chat.openMessageId = id;
+          updateMessages((list) => list.map((message) => (message.id === id ? { ...raw, id } : message)));
+          chat.pendingUserId = null;
         } else {
           const id = newMessageId(raw.role === "assistant" ? "assistant" : raw.role);
-          openMessageId = id;
+          chat.openMessageId = id;
           if (raw.role === "assistant") {
-            liveAssistantId = id;
-            liveId.set(id);
+            chat.liveAssistantId = id;
+            set({ liveId: id });
           }
-          messages.update((list) => [...list, { ...raw, id }]);
+          updateMessages((list) => [...list, { ...raw, id }]);
         }
         break;
       }
       case "message_update": {
-        if (!liveAssistantId) break;
+        if (!chat.liveAssistantId) break;
         const update = (event.assistantMessageEvent ?? {}) as Record<string, unknown>;
-        const id = liveAssistantId;
-        messages.update((list) =>
+        const id = chat.liveAssistantId;
+        updateMessages((list) =>
           list.map((message) => (message.id === id ? { ...message, content: applyAssistantDelta(contentBlocks(message.content), update) } : message)),
         );
         break;
@@ -366,91 +625,110 @@ function App() {
       case "message_end": {
         const raw = event.message as PiMessage | undefined;
         if (!raw) break;
-        const id = openMessageId ?? newMessageId(raw.role);
+        const id = chat.openMessageId ?? newMessageId(raw.role);
         let found = false;
-        messages.update((list) =>
+        updateMessages((list) =>
           list.map((message) => {
             if (message.id !== id) return message;
             found = true;
             return { ...raw, id };
           }),
         );
-        if (!found) messages.update((list) => [...list, { ...raw, id }]);
+        if (!found) updateMessages((list) => [...list, { ...raw, id }]);
         if (raw.role === "assistant") {
-          liveAssistantId = null;
-          liveId.set(null);
+          chat.liveAssistantId = null;
+          set({ liveId: null });
         }
-        openMessageId = null;
+        chat.openMessageId = null;
         break;
       }
       case "tool_execution_start": {
         const id = String(event.toolCallId ?? "");
         if (!id) break;
-        toolRuns.update((runs) => ({
-          ...runs,
-          [id]: {
-            ...runs[id],
-            args: (event.args as Record<string, unknown> | undefined) ?? runs[id]?.args,
-            running: true,
+        const runs = chat.state.toolRuns;
+        set({
+          toolRuns: {
+            ...runs,
+            [id]: { ...runs[id], args: (event.args as Record<string, unknown> | undefined) ?? runs[id]?.args, running: true },
           },
-        }));
+        });
         break;
       }
       case "tool_execution_update": {
         const id = String(event.toolCallId ?? "");
         if (!id) break;
         const partial = event.partialResult as { content?: unknown } | undefined;
-        toolRuns.update((runs) => ({
-          ...runs,
-          [id]: { ...runs[id], running: true, result: textOfContent(partial?.content) },
-        }));
+        const runs = chat.state.toolRuns;
+        set({ toolRuns: { ...runs, [id]: { ...runs[id], running: true, result: textOfContent(partial?.content) } } });
         break;
       }
       case "tool_execution_end": {
         const id = String(event.toolCallId ?? "");
         if (!id) break;
         const result = event.result as { content?: unknown } | undefined;
-        toolRuns.update((runs) => ({
-          ...runs,
-          [id]: {
-            ...runs[id],
-            running: false,
-            result: textOfContent(result?.content),
-            isError: event.isError === true,
-            durationMs: typeof event.durationMs === "number" ? event.durationMs : undefined,
+        const runs = chat.state.toolRuns;
+        set({
+          toolRuns: {
+            ...runs,
+            [id]: {
+              ...runs[id],
+              running: false,
+              result: textOfContent(result?.content),
+              isError: event.isError === true,
+              durationMs: typeof event.durationMs === "number" ? event.durationMs : undefined,
+            },
           },
-        }));
+        });
         break;
       }
       case "agent_settled": {
-        running.set(false);
-        liveId.set(null);
-        liveAssistantId = null;
-        status.set(null);
-        collapseAllWork();
-        const projectPath = activeProject();
-        if (projectPath) void refreshProject(projectPath);
+        chat.liveAssistantId = null;
+        set({ running: false, liveId: null, status: null });
+        collapseAllWork(chat);
+        bumpSession(chat);
+        trimChatStates();
+        if (chat.path) {
+          void fs.stat(chat.path).then(
+            (stats) => {
+              chat.mtimeMs = stats.mtimeMs;
+              chat.size = stats.size;
+              chat.loadedAt = Date.now();
+            },
+            () => {},
+          );
+        }
         break;
       }
       case "auto_retry_start": {
-        status.set(`Retrying · attempt ${String(event.attempt ?? "?")}${event.maxAttempts ? ` of ${String(event.maxAttempts)}` : ""}`);
+        set({ status: `Retrying · attempt ${String(event.attempt ?? "?")}${event.maxAttempts ? ` of ${String(event.maxAttempts)}` : ""}` });
         break;
       }
       case "auto_retry_end": {
-        status.set(event.success === false ? `Retry failed: ${String(event.finalError ?? "unknown error")}` : null);
+        set({ status: event.success === false ? `Retry failed: ${String(event.finalError ?? "unknown error")}` : null });
         break;
       }
       case "compaction_start": {
-        status.set("Compacting context…");
+        set({ status: "Compacting context…" });
         break;
       }
       case "compaction_end": {
-        status.set(event.errorMessage ? `Compaction failed: ${String(event.errorMessage)}` : null);
+        set({ status: event.errorMessage ? `Compaction failed: ${String(event.errorMessage)}` : null });
         break;
       }
       case "session_info_changed": {
-        const projectPath = activeProject();
-        if (projectPath) void refreshProject(projectPath);
+        const projectPath = chat.projectPath;
+        const sessionPath = chat.path;
+        const name = typeof event.name === "string" ? event.name.trim() : "";
+        if (!projectPath || !sessionPath) break;
+        if (!name) {
+          void refreshProject(projectPath);
+          break;
+        }
+        const title = cleanSessionTitle(name);
+        sessions.update((current) => ({
+          ...current,
+          [projectPath]: (current[projectPath] ?? []).map((item) => (item.path === sessionPath ? { ...item, title } : item)),
+        }));
         break;
       }
       default:
@@ -458,173 +736,291 @@ function App() {
     }
   };
 
-  const dropClient = () => {
-    if (client) {
-      client.close();
-      client = null;
+  const closeChatClient = (chat: ChatSession) => {
+    chat.generation++;
+    chat.clientReady = null;
+    if (chat.client) {
+      chat.client.close();
+      chat.client = null;
     }
   };
 
-  const resetChat = () => {
-    clientGeneration++;
-    dropClient();
-    messages.set([]);
-    toolRuns.set({});
-    collapsed.set(new Set());
-    expandedBlocks.set(new Set());
-    running.set(false);
-    loading.set(false);
-    status.set(null);
-    error.set(null);
-    modelOpen.set(false);
-    liveId.set(null);
-    liveAssistantId = null;
-    openMessageId = null;
-    pendingUserId = null;
-    draft.set("");
-    inputHeight.set(22);
+  const liveClientCount = () => {
+    let count = 0;
+    for (const chat of chats.values()) if (chat.client) count++;
+    return count;
   };
 
-  const startClient = async (projectPath: string, sessionPath: string | null, generation: number): Promise<PiClient> => {
-    lastStderr = "";
+  const evictClients = () => {
+    const now = Date.now();
+    const active = activeChat();
+    for (const chat of chats.values()) {
+      if (!chat.client || chat === active || chat.state.running) continue;
+      if (now - chat.lastUsed > CLIENT_IDLE_MS) closeChatClient(chat);
+    }
+    let count = liveClientCount();
+    if (count > MAX_LIVE_CLIENTS) {
+      const candidates = [...chats.values()]
+        .filter((chat) => chat.client && chat !== active && !chat.state.running)
+        .sort((a, b) => a.lastUsed - b.lastUsed);
+      for (const chat of candidates) {
+        if (count <= MAX_LIVE_CLIENTS) break;
+        closeChatClient(chat);
+        count--;
+      }
+    }
+    trimChatStates();
+  };
+
+  const startClient = async (chat: ChatSession): Promise<PiClient> => {
+    if (!chat.projectPath) throw new Error("Choose a project first.");
+    const generation = ++chat.generation;
+    let stderr = "";
     const next = new PiClient({
-      projectPath,
-      sessionPath,
-      onEvent: (event) => handleEvent(event, generation),
+      projectPath: chat.projectPath,
+      sessionPath: chat.path,
+      onEvent: (event) => {
+        chat.lastUsed = Date.now();
+        handleEvent(event, chat, generation);
+      },
       onStderr: (line) => {
-        if (line.trim()) lastStderr = line.trim();
+        if (line.trim()) stderr = line.trim();
       },
       onExit: () => {
-        if (generation !== clientGeneration) return;
-        running.set(false);
-        loading.set(false);
-        liveId.set(null);
-        error.set(lastStderr || "pi stopped unexpectedly.");
+        if (generation !== chat.generation) return;
+        chat.client = null;
+        chat.liveAssistantId = null;
+        setChatState(chat, { running: false, loading: false, liveId: null, error: stderr || "pi stopped unexpectedly." });
       },
     });
     await next.start();
-    client = next;
+    if (generation !== chat.generation) {
+      next.close();
+      throw new Error("pi was closed");
+    }
+    chat.client = next;
+    chat.lastUsed = Date.now();
+    evictClients();
     return next;
   };
 
-  const refreshMany = async (list: ProjectInfo[]) => {
-    sessions.set(await scanAllProjects(list));
+  const ensureClient = (chat: ChatSession): Promise<PiClient> => {
+    if (chat.client) return Promise.resolve(chat.client);
+    if (!chat.clientReady) {
+      const pending = startClient(chat);
+      chat.clientReady = pending;
+      void pending.then(
+        () => {
+          if (chat.clientReady === pending) chat.clientReady = null;
+        },
+        () => {
+          if (chat.clientReady === pending) chat.clientReady = null;
+        },
+      );
+    }
+    return chat.clientReady;
   };
 
-  const openExistingSession = async (projectPath: string, sessionPath: string) => {
-    resetChat();
-    const generation = clientGeneration;
-    activeProject.set(projectPath);
-    activeSession.set(sessionPath);
-    expandedProjects.update((set) => withSetValue(set, projectPath, true));
-    modelChosen.set(false);
-    loading.set(true);
+  const activateChat = (chat: ChatSession) => {
+    chat.lastUsed = Date.now();
+    modelKey.set(chat.modelKey);
+    modelChosen.set(chat.modelChosen);
+    if (!chat.loaded) void loadChat(chat);
+    else if (!chat.client) void revalidateChat(chat);
+    evictClients();
+  };
+
+  const rememberActiveModel = () => {
+    const chat = activeChat();
+    if (chat === blankChat) return;
+    chat.modelKey = modelKey();
+    chat.modelChosen = modelChosen();
+  };
+
+  const adoptSessionPath = (chat: ChatSession, sessionPath: string) => {
+    if (chat.path === sessionPath) return;
+    const wasActive = activeChat() === chat;
+    if (chats.get(chat.id) === chat) chats.delete(chat.id);
+    chat.id = sessionPath;
+    chat.path = sessionPath;
+    chats.set(sessionPath, chat);
+    if (wasActive) {
+      activeSession.set(sessionPath);
+      draftChatId.set(null);
+    }
+    if (chat.projectPath) void refreshProject(chat.projectPath);
+  };
+
+  const refreshMany = async (list: ProjectInfo[]) => {
+    const next = await scanAllProjects(list);
+    sessions.set(next);
     try {
-      const started = await startClient(projectPath, sessionPath, generation);
-      const state = await started.request<{ model?: ModelInfo }>("get_state");
-      if (generation !== clientGeneration) return;
-      applyModel(state?.model);
-      const data = await started.request<{ messages?: PiMessage[] }>("get_messages");
-      if (generation !== clientGeneration) return;
-      const history = (data?.messages ?? []).map((message, index) => ({ ...message, id: `history-${index}-${message.timestamp ?? 0}` }));
-      messages.set(history);
-      collapsed.set(new Set(history.filter((message) => hasWork(message)).map((message) => message.id)));
-    } catch (reason) {
-      if (generation === clientGeneration) error.set(errorText(reason));
-    } finally {
-      if (generation === clientGeneration) loading.set(false);
+      await Storage.setItem(SESSIONS_KEY, JSON.stringify(next));
+    } catch {
+      // The sidebar still works without the cache.
     }
   };
 
+  const openExistingSession = (projectPath: string, sessionPath: string) => {
+    if (activeProject() === projectPath && activeSession() === sessionPath) return;
+    rememberActiveModel();
+    const previous = activeChat();
+    if (
+      previous !== blankChat &&
+      !previous.path &&
+      !previous.client &&
+      !previous.clientReady &&
+      previous.state.messages.length === 0 &&
+      chats.get(previous.id) === previous
+    ) {
+      chats.delete(previous.id);
+    }
+    const chat = ensureChat(sessionPath, projectPath, sessionPath);
+    activeProject.set(projectPath);
+    activeSession.set(sessionPath);
+    draftChatId.set(null);
+    expandedProjects.update((set) => withSetValue(set, projectPath, true));
+    activateChat(chat);
+  };
+
   const newChat = (projectPath?: string | null) => {
-    resetChat();
+    rememberActiveModel();
+    const previous = activeChat();
+    if (
+      previous !== blankChat &&
+      !previous.path &&
+      !previous.client &&
+      !previous.clientReady &&
+      previous.state.messages.length === 0 &&
+      chats.get(previous.id) === previous
+    ) {
+      chats.delete(previous.id);
+    }
+    const id = `draft:${++draftSequence}`;
+    const chat = createChatSession(id, projectPath ?? activeProject(), null);
+    chat.modelKey = modelKey();
+    chat.modelChosen = modelChosen();
+    chats.set(id, chat);
+    draftChatId.set(id);
     if (projectPath) {
       activeProject.set(projectPath);
       expandedProjects.update((set) => withSetValue(set, projectPath, true));
     }
     activeSession.set(null);
+    modelOpen.set(false);
+    evictClients();
   };
 
   const send = async () => {
     const text = draft().trim();
-    const projectPath = activeProject();
-    if (!text || running()) return;
+    if (!text) return;
+    if (activeChat() === blankChat) newChat();
+    const chat = activeChat();
+    if (chat.state.running) return;
     modelOpen.set(false);
+    const projectPath = chat.projectPath ?? activeProject();
     if (!projectPath) {
       addOpen.set(true);
       return;
     }
+    chat.projectPath = projectPath;
 
     const requestedModel = modelChosen() ? currentModel() : null;
-    error.set(null);
-    status.set(null);
+    const wasExisting = Boolean(chat.path);
+    const localId = newMessageId("local");
+    const optimistic: PiMessage = { id: localId, role: "user", content: text, timestamp: Date.now() };
+    chat.pendingUserId = localId;
+    appError.set(null);
+    setChatState(chat, { messages: [...chat.state.messages, optimistic], running: true, error: null, status: null });
     draft.set("");
     inputHeight.set(22);
-    const localId = newMessageId("local");
-    pendingUserId = localId;
-    messages.update((list) => [...list, { id: localId, role: "user", content: text, timestamp: Date.now() }]);
-    running.set(true);
     try {
-      if (!client) {
-        const generation = ++clientGeneration;
-        loading.set(true);
-        const started = await startClient(projectPath, activeSession(), generation);
-        const state = await started.request<{ sessionFile?: string; model?: ModelInfo }>("get_state");
-        if (generation !== clientGeneration) return;
-        if (state?.sessionFile && !activeSession()) {
-          activeSession.set(state.sessionFile);
-          void refreshProject(projectPath);
+      let started = chat.client;
+      if (!started) {
+        setChatState(chat, { loading: true });
+        started = await ensureClient(chat);
+        const state = await started.request<{ sessionFile?: string; messageCount?: number; model?: ModelInfo }>("get_state");
+        if (state?.sessionFile && !chat.path) adoptSessionPath(chat, state.sessionFile);
+        if (wasExisting && chat.path && typeof state?.messageCount === "number") {
+          const historyCount = chat.state.messages.length - 1;
+          if (state.messageCount !== historyCount) {
+            console.warn(`[pi-nsh] projected ${historyCount} messages, pi has ${state.messageCount}; reloading history`);
+            const data = await started.request<{ messages?: PiMessage[] }>("get_messages");
+            const history = (data?.messages ?? []).map((message, index) => ({ ...message, id: `history-${index}-${message.timestamp ?? 0}` }));
+            setChatState(chat, { messages: [...history, optimistic], collapsed: collapsedTurnsOf(history) });
+            chat.loaded = true;
+            chat.loadedAt = Date.now();
+          }
         }
-        applyModel(state?.model);
+        applyModel(state?.model, chat);
         if (requestedModel && state?.model && modelKeyOf(requestedModel) !== modelKeyOf(state.model)) {
           await started.request("set_model", { provider: requestedModel.provider, modelId: requestedModel.id });
-          applyModel(requestedModel);
+          applyModel(requestedModel, chat);
         }
-        loading.set(false);
+        setChatState(chat, { loading: false });
       }
-      await client?.request("prompt", { message: text });
+      await started.request("prompt", { message: text });
     } catch (reason) {
-      error.set(errorText(reason));
-      running.set(false);
-      loading.set(false);
-      pendingUserId = null;
-      messages.update((list) => list.filter((message) => message.id !== localId));
-      draft.set(text);
+      chat.pendingUserId = null;
+      setChatState(chat, {
+        error: errorText(reason),
+        running: false,
+        loading: false,
+        messages: chat.state.messages.filter((message) => message.id !== localId),
+      });
+      if (chat === activeChat()) draft.set(text);
     }
   };
 
   const stop = async () => {
-    if (!client || !running()) return;
-    status.set("Stopping…");
+    const chat = activeChat();
+    if (!chat.client || !chat.state.running) return;
+    setChatState(chat, { status: "Stopping…" });
     try {
-      await client.request("abort");
+      await chat.client.request("abort");
     } catch (reason) {
-      error.set(errorText(reason));
+      setChatState(chat, { error: errorText(reason) });
     } finally {
-      running.set(false);
-      status.set(null);
-      liveId.set(null);
+      if (chat.state.running) setChatState(chat, { running: false, status: null, liveId: null });
     }
   };
 
   const chooseModel = async (value: string | null) => {
     if (!value) return;
+    if (activeChat() === blankChat) newChat();
+    const chat = activeChat();
     const previous = modelKey();
     modelKey.set(value);
     modelChosen.set(true);
+    chat.modelKey = value;
+    chat.modelChosen = true;
     const model = models().find((item) => modelKeyOf(item) === value);
-    if (model && client) {
+    if (model && chat.client) {
       try {
-        await client.request("set_model", { provider: model.provider, modelId: model.id });
+        await chat.client.request("set_model", { provider: model.provider, modelId: model.id });
       } catch (reason) {
         modelKey.set(previous);
-        error.set(errorText(reason));
+        chat.modelKey = previous;
+        setChatState(chat, { error: errorText(reason) });
       }
     }
   };
 
   const toggleCollapsed = (id: string) => {
-    collapsed.update((set) => withSetValue(set, id, !set.has(id)));
+    const chat = activeChat();
+    if (chat === blankChat) return;
+    setChatState(chat, { collapsed: withSetValue(chat.state.collapsed, id, !chat.state.collapsed.has(id)) });
+  };
+
+  const toggleBlock = (key: string) => {
+    const chat = activeChat();
+    if (chat === blankChat) return;
+    setChatState(chat, { expandedBlocks: withSetValue(chat.state.expandedBlocks, key, !chat.state.expandedBlocks.has(key)) });
+  };
+
+  const clearExpandedBlocks = () => {
+    const chat = activeChat();
+    if (chat !== blankChat) setChatState(chat, { expandedBlocks: new Set() });
   };
 
   const toggleProject = (projectPath: string) => {
@@ -696,10 +1092,18 @@ function App() {
       return copy;
     });
     await persistProjects(next);
+    for (const chat of [...chats.values()]) {
+      if (chat.projectPath !== projectPath) continue;
+      closeChatClient(chat);
+      chats.delete(chat.id);
+    }
     if (activeProject() === projectPath) {
       activeProject.set(null);
       activeSession.set(null);
-      resetChat();
+      draftChatId.set(null);
+      modelOpen.set(false);
+      draft.set("");
+      inputHeight.set(22);
     }
   };
 
@@ -718,39 +1122,70 @@ function App() {
         list = await discoverProjects();
         await Storage.setItem(PROJECTS_KEY, JSON.stringify(list));
       }
-      list = list.filter((item) => item.path !== os.homedir());
+      let cachedSessions: Record<string, SessionInfo[]> = {};
+      try {
+        const storedSessions = await Storage.getItem(SESSIONS_KEY);
+        if (storedSessions) {
+          const parsed = JSON.parse(storedSessions) as Record<string, SessionInfo[]>;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            cachedSessions = Object.fromEntries(Object.entries(parsed).filter(([, list]) => Array.isArray(list)));
+            seedSessionCache(Object.values(cachedSessions).flat());
+          }
+        }
+      } catch {
+        cachedSessions = {};
+      }
       projects.set(list);
-      await refreshMany(list);
+      sessions.set(cachedSessions);
       if (list.length) {
         activeProject.set(list[0].path);
         expandedProjects.set(new Set(list.map((project) => project.path)));
       }
+      booted.set(true);
+      await refreshMany(list);
     } catch (reason) {
-      error.set(errorText(reason));
+      appError.set(errorText(reason));
     } finally {
       booted.set(true);
     }
   };
 
+  const loadModels = (): Promise<void> => {
+    if (catalogLoading) return catalogLoading;
+    catalogLoading = (async () => {
+      try {
+        const catalog = await loadCatalog();
+        models.set(catalog.models);
+        if (catalog.defaultModel && !modelKey()) {
+          applyModel(catalog.defaultModel);
+          const chat = activeChat();
+          if (chat !== blankChat && !chat.modelKey) chat.modelKey = modelKey();
+        }
+        piIssue.set(null);
+      } catch (reason) {
+        piIssue.set(errorText(reason));
+      }
+    })();
+    return catalogLoading;
+  };
+
   void boot();
-  (async () => {
-    try {
-      const catalog = await loadCatalog();
-      models.set(catalog.models);
-      if (catalog.defaultModel) applyModel(catalog.defaultModel);
-      piIssue.set(null);
-    } catch (reason) {
-      piIssue.set(errorText(reason));
-    }
-  })();
+  // The catalog needs its own pi process; let the first chat open first.
+  const catalogTimer = setTimeout(() => void loadModels(), 1500);
+  const poolTimer = setInterval(evictClients, 60_000);
 
   cleanup(() => {
-    clientGeneration++;
-    dropClient();
+    for (const chat of chats.values()) closeChatClient(chat);
+    clearTimeout(catalogTimer);
+    clearInterval(poolTimer);
   });
 
   effect(() => {
     if (addOpen()) addCardRef?.focus();
+  });
+
+  effect(() => {
+    if (modelOpen()) void loadModels();
   });
 
   cleanup(
@@ -839,37 +1274,49 @@ function App() {
               </View>
             </If>
             <Each of={visible()}>
-              {(session) => (
-                <Press
-                  onPress={() => void openExistingSession(projectPath(), session().path)}
-                  hoverStyle={{ backgroundColor: colors.sidebarAccent }}
-                  style={{
-                    height: 28,
-                    marginLeft: 4,
-                    borderRadius: 7,
-                    paddingLeft: 27,
-                    paddingRight: 8,
-                    alignItems: "flex-start",
-                    justifyContent: "center",
-                    backgroundColor: activeSession() === session().path ? colors.sidebarAccent : "transparent",
-                  }}
-                  accessibilityLabel={session().title}
-                  accessibilityState={{ selected: activeSession() === session().path }}
-                >
-                  <Text
+              {(session) => {
+                const busy = computed(() => {
+                  chatActivity();
+                  return chats.get(session().path)?.state.running ?? false;
+                });
+                return (
+                  <Press
+                    onPress={() => void openExistingSession(projectPath(), session().path)}
+                    hoverStyle={{ backgroundColor: colors.sidebarAccent }}
                     style={{
-                      width: "100%",
-                      numberOfLines: 1,
-                      textOverflow: "ellipsis",
-                      fontSize: 12.5,
-                      color: activeSession() === session().path ? colors.text : colors.mutedText,
-                      fontWeight: activeSession() === session().path ? "500" : "400",
+                      height: 28,
+                      marginLeft: 4,
+                      borderRadius: 7,
+                      paddingLeft: 27,
+                      paddingRight: 8,
+                      alignItems: "flex-start",
+                      justifyContent: "center",
+                      backgroundColor: activeSession() === session().path ? colors.sidebarAccent : "transparent",
                     }}
+                    accessibilityLabel={session().title}
+                    accessibilityState={{ selected: activeSession() === session().path }}
                   >
-                    {session().title}
-                  </Text>
-                </Press>
-              )}
+                    <View style={{ width: "100%", flexDirection: "row", alignItems: "center", gap: 6 }}>
+                      <Text
+                        style={{
+                          flex: 1,
+                          minWidth: 0,
+                          numberOfLines: 1,
+                          textOverflow: "ellipsis",
+                          fontSize: 12.5,
+                          color: activeSession() === session().path ? colors.text : colors.mutedText,
+                          fontWeight: activeSession() === session().path ? "500" : "400",
+                        }}
+                      >
+                        {session().title}
+                      </Text>
+                      <If when={busy()}>
+                        <Spinner size={10} tint={colors.faint} />
+                      </If>
+                    </View>
+                  </Press>
+                );
+              }}
             </Each>
             <If when={projectSessions().length > VISIBLE_SESSIONS}>
               <Press
@@ -1013,7 +1460,7 @@ function App() {
     const failed = computed(() => run()?.isError === true || historical()?.isError === true);
     const duration = computed(() => formatDuration(run()?.durationMs));
     const expanded = computed(() => expandedBlocks().has(props.blockKey()));
-    const toggle = () => expandedBlocks.update((set) => withSetValue(set, props.blockKey(), !expanded()));
+    const toggle = () => toggleBlock(props.blockKey());
     return (
       <View style={{ borderWidth: 1, borderColor: colors.line, borderRadius: 8, backgroundColor: colors.card, overflow: "hidden" }}>
         <Press
@@ -1065,7 +1512,7 @@ function App() {
     return (
       <View style={{ borderWidth: 1, borderColor: colors.line, borderRadius: 8, backgroundColor: colors.card, overflow: "hidden" }}>
         <Press
-          onPress={() => expandedBlocks.update((set) => withSetValue(set, block().key, !expanded()))}
+          onPress={() => toggleBlock(block().key)}
           hoverStyle={{ backgroundColor: "transparent" }}
           activeStyle={{ opacity: 0.8 }}
           style={{ minHeight: 30, paddingHorizontal: 8, paddingVertical: 6, flexDirection: "row", alignItems: "center", gap: 6 }}
@@ -1105,7 +1552,7 @@ function App() {
             onPress={() => {
               const nextOpen = !open();
               toggleCollapsed(props.turnKey());
-              if (!nextOpen) expandedBlocks.set(new Set());
+              if (!nextOpen) clearExpandedBlocks();
             }}
             hoverStyle={{ backgroundColor: "transparent" }}
             activeStyle={{ opacity: 0.65 }}
@@ -1168,10 +1615,12 @@ function App() {
     );
   }
 
-  function MessageRow(props: { message: () => PiMessage }) {
+  function MessageRow(props: { message: () => PiMessage | undefined }) {
     const message = props.message;
-    const role = computed(() => message().role);
-    const text = computed(() => textOfContent(message().content));
+    const role = computed(() => message()?.role ?? "");
+    const text = computed(() => textOfContent(message()?.content));
+
+    if (!message()) return <View />;
 
     if (role() === "compactionSummary" || role() === "branchSummary") {
       return (
@@ -1189,7 +1638,7 @@ function App() {
         <View style={{ width: "100%", maxWidth: contentMetrics.maxWidth, alignSelf: "center", paddingHorizontal: contentMetrics.padding, paddingVertical: 7 }}>
           <View style={{ borderWidth: 1, borderColor: colors.line, borderRadius: 9, backgroundColor: colors.inset, padding: 10, gap: 4 }}>
             <Text style={{ fontSize: 10.5, color: colors.faint }}>COMMAND</Text>
-            <Text style={{ fontFamily: "Menlo", fontSize: 11.5, color: colors.text, userSelect: "text" }}>{String(message().command ?? "")}</Text>
+            <Text style={{ fontFamily: "Menlo", fontSize: 11.5, color: colors.text, userSelect: "text" }}>{String(message()?.command ?? "")}</Text>
           </View>
         </View>
       );
@@ -1229,10 +1678,16 @@ function App() {
     );
   }
 
-  function TurnRow(props: { item: () => TurnDisplay }) {
+  function TurnRow(props: { item: () => DisplayItem }) {
     const item = props.item;
-    const turnMessages = computed(() => item().messages);
-    const turnKey = computed(() => item().key);
+    const turnMessages = computed(() => {
+      const value = item();
+      return value.kind === "turn" ? value.messages : [];
+    });
+    const turnKey = computed(() => {
+      const value = item();
+      return value.kind === "turn" ? value.key : "";
+    });
     const text = computed(() =>
       turnMessages()
         .map((message) => assistantText(message))
@@ -1274,9 +1729,11 @@ function App() {
   function TimelineRow(props: { item: () => DisplayItem }) {
     const item = props.item;
     const kind = computed(() => item().kind);
-    if (kind() === "user") return <MessageRow message={() => (item() as UserDisplay).message} />;
-    if (kind() === "turn") return <TurnRow item={() => item() as TurnDisplay} />;
-    return <MessageRow message={() => (item() as NoteDisplay).message} />;
+    if (kind() === "user") {
+      return <MessageRow message={() => (item().kind === "user" ? (item() as UserDisplay).message : undefined)} />;
+    }
+    if (kind() === "turn") return <TurnRow item={item} />;
+    return <MessageRow message={() => (item().kind === "note" ? (item() as NoteDisplay).message : undefined)} />;
   }
 
   function ModelPicker() {
@@ -1307,6 +1764,13 @@ function App() {
       >
         <View style={{ width: 280, height: modelMenuHeight() }}>
           <Scroll style={{ flex: 1, minHeight: 0 }} contentStyle={{ padding: 4 }} scrollbar>
+            <If when={models().length === 0}>
+              <View style={{ height: 32, paddingHorizontal: 8, justifyContent: "center" }}>
+                <Text style={{ fontSize: 12, numberOfLines: 1, textOverflow: "ellipsis", color: colors.faint }}>
+                  {piIssue() ? oneLine(piIssue() ?? "", 60) : "Loading models…"}
+                </Text>
+              </View>
+            </If>
             <Each of={modelGroups()}>
               {(group) => (
                 <View>
@@ -1326,10 +1790,10 @@ function App() {
                         activeStyle={{ opacity: 0.75 }}
                         style={{ height: 28, borderRadius: 6, paddingHorizontal: 6, flexDirection: "row", alignItems: "center", gap: 8 }}
                       >
-                        <Text style={{ flex: 1, numberOfLines: 1, textOverflow: "ellipsis", fontSize: 12.5, color: colors.text, fontWeight: modelKeyOf(model()) === modelKey() ? "500" : "400" }}>
+                        <Text style={{ flex: 1, numberOfLines: 1, textOverflow: "ellipsis", fontSize: 12.5, color: colors.text, fontWeight: modelMatchesKey(model(), modelKey()) ? "500" : "400" }}>
                           {model().name || model().id}
                         </Text>
-                        <If when={modelKeyOf(model()) === modelKey()}>
+                        <If when={modelMatchesKey(model(), modelKey())}>
                           <Icon name="check" size={12} tint={colors.text} />
                         </If>
                       </View>
@@ -1481,29 +1945,57 @@ function App() {
   function Chat() {
     return (
       <View style={{ flex: 1, minHeight: 0 }}>
-        <If
-          when={loading() && messages().length === 0}
-          else={
-            <List
-              each={displayItems()}
-              keyExtractor={(item) => item.id}
-              estimatedItemSize={180}
-              alignment="bottom"
-              initialScrollAtEnd
-              maintainVisibleContentPosition={{ autoscrollToBottomThreshold: 90 }}
-              style={{ flex: 1 }}
-              contentStyle={{ paddingTop: 16, paddingBottom: 4 }}
-              scrollbar
+        <Each of={[activeChat().id]}>
+          {() => (
+            <If
+              when={loading() && messages().length === 0}
+              else={
+                <List
+                  each={visibleItems()}
+                  keyExtractor={(item) => item.id}
+                  estimatedItemSize={180}
+                  alignment="bottom"
+                  initialScrollAtEnd
+                  maintainVisibleContentPosition={{ autoscrollToBottomThreshold: 90 }}
+                  header={
+                    hasEarlier() ? (
+                      <View style={{ alignItems: "center", paddingVertical: 8 }}>
+                        <Press
+                          onPress={showEarlier}
+                          style={{
+                            height: 26,
+                            paddingHorizontal: 10,
+                            borderRadius: 7,
+                            borderWidth: 1,
+                            borderColor: colors.line,
+                            backgroundColor: colors.card,
+                            alignItems: "center",
+                            justifyContent: "center",
+                          }}
+                        >
+                          <Text style={{ fontSize: 11.5, color: colors.mutedText }}>Load earlier messages</Text>
+                        </Press>
+                      </View>
+                    ) : undefined
+                  }
+                  onLoadMoreAtStart={hasEarlier() ? showEarlier : undefined}
+                  loadMoreAtStartThreshold={1.5}
+                  testID="chat-list"
+                  style={{ flex: 1 }}
+                  contentStyle={{ paddingTop: 16, paddingBottom: 4 }}
+                  scrollbar
+                >
+                  {(item) => <TimelineRow item={item} />}
+                </List>
+              }
             >
-              {(item) => <TimelineRow item={item} />}
-            </List>
-          }
-        >
-          <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: 8 }}>
-            <Spinner size={14} />
-            <Text style={{ fontSize: 12, color: colors.faint }}>Loading conversation…</Text>
-          </View>
-        </If>
+              <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: 8 }}>
+                <Spinner size={14} />
+                <Text style={{ fontSize: 12, color: colors.faint }}>Loading conversation…</Text>
+              </View>
+            </If>
+          )}
+        </Each>
         <Composer />
       </View>
     );
@@ -1636,7 +2128,7 @@ function App() {
               </View>
             }
           >
-            <If when={!activeProject()} else={<If when={!activeSession()} else={<Chat />}><NewChat /></If>}>
+            <If when={!activeProject()} else={<If when={!chatOpen()} else={<Chat />}><NewChat /></If>}>
               <EmptyProject />
             </If>
           </If>

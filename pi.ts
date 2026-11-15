@@ -13,6 +13,15 @@ export interface SessionInfo {
   path: string;
   title: string;
   modified: number;
+  mtimeMs?: number;
+  size?: number;
+}
+
+export interface SessionHistory {
+  messages: PiMessage[];
+  model: { provider: string; id: string } | null;
+  mtimeMs: number;
+  size: number;
 }
 
 export interface ProjectInfo {
@@ -208,7 +217,7 @@ function resolvedPi(): Promise<PiResolution> {
   return piResolutionPromise;
 }
 
-function cleanTitle(value: string): string {
+export function cleanSessionTitle(value: string): string {
   const text = value.replace(/\s+/g, " ").trim();
   return text.length > 96 ? text.slice(0, 95).trimEnd() + "…" : text;
 }
@@ -237,7 +246,7 @@ function parseLines(text: string): Record<string, unknown>[] {
   return records;
 }
 
-async function readSession(filePath: string, modified: number): Promise<SessionInfo | null> {
+async function readSession(filePath: string, stats: { mtimeMs: number; size: number }): Promise<SessionInfo | null> {
   const text = await fs.readFile(filePath, "utf8");
   let isSession = false;
   let name = "";
@@ -252,11 +261,36 @@ async function readSession(filePath: string, modified: number): Promise<SessionI
     }
     if (record.type !== "message") continue;
     const message = record.message as Record<string, unknown> | undefined;
-    if (!firstMessage && message?.role === "user") firstMessage = cleanTitle(textOfContent(message.content));
+    if (!firstMessage && message?.role === "user") firstMessage = cleanSessionTitle(textOfContent(message.content));
   }
   if (!isSession) return null;
 
-  return { path: filePath, title: cleanTitle(name || firstMessage || "New chat"), modified };
+  return { path: filePath, title: cleanSessionTitle(name || firstMessage || "New chat"), modified: stats.mtimeMs, mtimeMs: stats.mtimeMs, size: stats.size };
+}
+
+type ScannedSession = {
+  mtimeMs: number;
+  size: number;
+  session: SessionInfo | null;
+};
+
+const sessionScanCache = new Map<string, ScannedSession>();
+
+async function cachedSession(filePath: string, stats: { mtimeMs: number; size: number }): Promise<SessionInfo | null> {
+  const cached = sessionScanCache.get(filePath);
+  if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) return cached.session;
+  const session = await readSession(filePath, stats);
+  if (sessionScanCache.size > 512) sessionScanCache.clear();
+  sessionScanCache.set(filePath, { mtimeMs: stats.mtimeMs, size: stats.size, session });
+  return session;
+}
+
+/** Reuses the sidebar a previous launch saved, so unchanged sessions are not parsed again. */
+export function seedSessionCache(sessions: SessionInfo[]): void {
+  for (const session of sessions) {
+    if (typeof session.mtimeMs !== "number" || typeof session.size !== "number") continue;
+    sessionScanCache.set(session.path, { mtimeMs: session.mtimeMs, size: session.size, session });
+  }
 }
 
 export async function scanProjectSessions(cwd: string): Promise<SessionInfo[]> {
@@ -275,7 +309,7 @@ export async function scanProjectSessions(cwd: string): Promise<SessionInfo[]> {
     const filePath = path.join(dir, entry.name);
     try {
       const stats = await fs.stat(filePath);
-      const session = await readSession(filePath, stats.mtimeMs);
+      const session = await cachedSession(filePath, stats);
       if (session) out.push(session);
     } catch {
       // One unreadable or still-empty session must not hide the others.
@@ -343,16 +377,191 @@ export async function discoverProjects(limit = 12): Promise<ProjectInfo[]> {
   }
   found.sort((a, b) => b.modified - a.modified);
   const seen = new Set<string>();
-  const home = os.homedir();
   const projects: ProjectInfo[] = [];
   for (const item of found) {
-    if (item.project.path === home) continue;
     if (seen.has(item.project.path)) continue;
     seen.add(item.project.path);
     projects.push(item.project);
     if (projects.length >= limit) break;
   }
   return projects;
+}
+
+const HISTORY_TOOL_RESULT_LIMIT = 2000;
+/** The session format this reader projects; newer formats come from pi itself. */
+export const SUPPORTED_SESSION_VERSION = 3;
+
+function timestampOf(value: unknown): number | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const time = typeof value === "number" ? value : Date.parse(value);
+  return Number.isFinite(time) ? time : undefined;
+}
+
+function sessionEntryMessages(entry: Record<string, unknown>): PiMessage[] {
+  if (entry.type === "message") {
+    const message = entry.message as PiMessage | undefined;
+    if (!message || typeof message !== "object") return [];
+    if (message.content == null) {
+      if (message.role === "system") return [{ ...message, content: "" }];
+      if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") return [{ ...message, content: [] }];
+    }
+    return [message];
+  }
+  if (entry.type === "custom_message") {
+    return [
+      {
+        id: "",
+        role: "custom",
+        customType: entry.customType,
+        content: (entry.content ?? []) as PiMessage["content"],
+        display: entry.display,
+        details: entry.details,
+        timestamp: timestampOf(entry.timestamp),
+      } as PiMessage,
+    ];
+  }
+  if (entry.type === "branch_summary" && typeof entry.summary === "string") {
+    return [
+      { id: "", role: "branchSummary", content: "", summary: entry.summary, fromId: entry.fromId, timestamp: timestampOf(entry.timestamp) } as PiMessage,
+    ];
+  }
+  if (entry.type === "compaction" && typeof entry.summary === "string") {
+    const summary = {
+      id: "",
+      role: "compactionSummary",
+      content: "",
+      summary: entry.summary,
+      tokensBefore: entry.tokensBefore,
+      timestamp: timestampOf(entry.timestamp),
+    } as PiMessage;
+    const system = entry.systemMessage as PiMessage | undefined;
+    return system ? [system, summary] : [summary];
+  }
+  return [];
+}
+
+function applyContextEdit(messages: PiMessage[], replacement: unknown): PiMessage[] {
+  if (replacement === null) return [];
+  const content = (replacement as { content?: unknown } | undefined)?.content;
+  if (content === undefined) return messages;
+  return messages.map((message) => {
+    if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult" && message.role !== "custom") return message;
+    const next = (message.role === "assistant" || message.role === "toolResult") && typeof content === "string" ? [{ type: "text", text: content }] : content;
+    return { ...message, content: next as PiMessage["content"] };
+  });
+}
+
+// The chat renders text, thinking and tool calls only: media and clipped tool
+// output are dropped so large sessions stay small in memory.
+function trimHistoryMessage(message: PiMessage): PiMessage {
+  if (typeof message.content === "string") {
+    if (message.role !== "toolResult" || message.content.length <= HISTORY_TOOL_RESULT_LIMIT) return message;
+    return { ...message, content: `${message.content.slice(0, HISTORY_TOOL_RESULT_LIMIT)}…` };
+  }
+  if (!Array.isArray(message.content)) return message;
+  let trimmed = false;
+  const content = message.content.flatMap((block) => {
+    if (block?.type === "image" || block?.type === "audio" || block?.type === "file") {
+      trimmed = true;
+      return [];
+    }
+    if (message.role !== "toolResult") return [block];
+    if (block?.type !== "text") {
+      trimmed = true;
+      return [];
+    }
+    if (typeof block.text !== "string" || block.text.length <= HISTORY_TOOL_RESULT_LIMIT) return [block];
+    trimmed = true;
+    return [{ ...block, text: `${block.text.slice(0, HISTORY_TOOL_RESULT_LIMIT)}…` }];
+  });
+  return trimmed ? { ...message, content } : message;
+}
+
+/**
+ * Reads a session file the way pi resumes it: the entries on the current leaf
+ * path, with compaction and context edits applied. This keeps opening a chat
+ * off the `pi` startup path while matching what `get_messages` would return.
+ */
+export async function loadSessionHistory(filePath: string): Promise<SessionHistory> {
+  const [stats, text] = await Promise.all([fs.stat(filePath), fs.readFile(filePath, "utf8")]);
+  const records = parseLines(text);
+  const header = records.find((record) => record.type === "session");
+  if (!header) {
+    if (text.trim()) throw new Error("Not a pi session file.");
+    return { messages: [], model: null, mtimeMs: stats.mtimeMs, size: stats.size };
+  }
+  const version = typeof header.version === "number" ? header.version : 1;
+  if (version !== SUPPORTED_SESSION_VERSION) {
+    throw new Error(`Unsupported pi session version ${version}; this build reads ${SUPPORTED_SESSION_VERSION}.`);
+  }
+  const entries = records.filter((record) => record.type !== "session");
+
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const entry of entries) {
+    if (typeof entry.id === "string") byId.set(entry.id, entry);
+  }
+
+  const path: Record<string, unknown>[] = [];
+  let current: Record<string, unknown> | undefined = entries[entries.length - 1];
+  const visited = new Set<string>();
+  while (current) {
+    path.push(current);
+    const id = typeof current.id === "string" ? current.id : undefined;
+    if (id) {
+      if (visited.has(id)) break;
+      visited.add(id);
+    }
+    const parentId: string | undefined = typeof current.parentId === "string" ? current.parentId : undefined;
+    current = parentId ? byId.get(parentId) : undefined;
+  }
+  path.reverse();
+
+  let compaction: Record<string, unknown> | null = null;
+  for (const entry of path) {
+    if (entry.type === "compaction") compaction = entry;
+  }
+  let contextEntries = path;
+  if (compaction) {
+    const index = path.indexOf(compaction);
+    const kept: Record<string, unknown>[] = [compaction];
+    let foundFirstKept = false;
+    for (let entryIndex = 0; entryIndex < index; entryIndex++) {
+      const entry = path[entryIndex];
+      if (entry.id === compaction.firstKeptEntryId) foundFirstKept = true;
+      if (foundFirstKept && !(entry.type === "message" && (entry.message as PiMessage | undefined)?.role === "system")) kept.push(entry);
+    }
+    kept.push(...path.slice(index + 1));
+    contextEntries = kept;
+  }
+
+  const edits = new Map<string, unknown>();
+  for (const entry of contextEntries) {
+    if (entry.type === "context_edit" && typeof entry.targetId === "string") edits.set(entry.targetId, entry.replacement);
+  }
+
+  const history: PiMessage[] = [];
+  contextEntries.forEach((entry, index) => {
+    if (entry.type === "compaction" && index > 0) return;
+    let messages = sessionEntryMessages(entry);
+    const edit = typeof entry.id === "string" ? edits.get(entry.id) : undefined;
+    if (edit !== undefined) messages = applyContextEdit(messages, edit);
+    for (const message of messages) history.push(trimHistoryMessage(message));
+  });
+  const messages = history.map((message, index) => ({ ...message, id: `history-${index}-${message.timestamp ?? 0}` }));
+
+  let model: SessionHistory["model"] = null;
+  for (const entry of path) {
+    if (entry.type === "model_change" && typeof entry.provider === "string" && typeof entry.modelId === "string") {
+      model = { provider: entry.provider, id: entry.modelId };
+    } else if (entry.type === "message") {
+      const message = entry.message as PiMessage | undefined;
+      if (message?.role === "assistant" && typeof message.provider === "string" && typeof message.model === "string") {
+        model = { provider: message.provider, id: message.model };
+      }
+    }
+  }
+
+  return { messages, model, mtimeMs: stats.mtimeMs, size: stats.size };
 }
 
 export class PiClient {
@@ -362,6 +571,7 @@ export class PiClient {
   private pending = new Map<string, Pending>();
   private closed = false;
   private expectedExit = false;
+  private startPromise: Promise<void> | null = null;
 
   constructor(options: ClientOptions) {
     this.options = options;
@@ -369,6 +579,11 @@ export class PiClient {
 
   async start(): Promise<void> {
     if (this.child) return;
+    if (!this.startPromise) this.startPromise = this.launch();
+    return this.startPromise;
+  }
+
+  private async launch(): Promise<void> {
     if (process.platform === "web") {
       throw new Error("pi can only run in the native app");
     }
@@ -388,6 +603,10 @@ export class PiClient {
       if ((reason as { code?: string }).code !== "ENOENT") throw reason;
       const resolution = await resolvedPi();
       child = process.spawn("env", [`PATH=${resolution.pathValue}`, resolution.executable, ...args], spawnOptions);
+    }
+    if (this.expectedExit) {
+      child.kill();
+      return;
     }
     this.child = child;
 
@@ -452,9 +671,9 @@ export class PiClient {
   }
 
   close(): void {
-    if (!this.child) return;
     this.expectedExit = true;
     this.closed = true;
+    if (!this.child) return;
     const error = new Error("pi was closed");
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
