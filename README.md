@@ -6,17 +6,22 @@ A small native desktop UI for the [pi coding agent](https://github.com/earendil-
 
 ## Requirements
 
-- macOS
+- macOS (Apple silicon) or Windows (x64)
 - `nsh` 0.5.1 or newer
 - `pi` installed for the current user; the app checks `PATH`, npm, nvm, fnm, bun, pnpm, mise, and Homebrew locations (it drives `pi --mode rpc`)
+
+## Download
+
+Prebuilt macOS (Apple silicon) and Windows (x64) archives are on [Releases](https://github.com/liuzhch1/pi-nsh/releases).
 
 ## Run
 
 ```bash
 nsh run . --target macos
+nsh run . --target windows
 ```
 
-Package an app bundle with:
+Package the app with:
 
 ```bash
 nsh package . --target macos -o .nsh/out

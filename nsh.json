@@ -1,7 +1,7 @@
 {
   "name": "Pi",
   "id": "dev.pi.nsh",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "build": 1,
   "appearance": "system",
   "theme": "theme.json",

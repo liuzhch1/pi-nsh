@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            name: macOS arm64
+            artifact: macos-arm64
+          - os: windows-2025
+            name: Windows x64
+            artifact: windows-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nsh
+        if: runner.os == 'macOS'
+        env:
+          NSH_VERSION: v0.5.1
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install nsh
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NSH_VERSION: v0.5.1
+        run: |
+          irm https://nsh.dev/install.ps1 | iex
+          "$env:LOCALAPPDATA\nsh\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify nsh
+        shell: bash
+        run: nsh --version
+
+      - name: Check
+        shell: bash
+        run: nsh check
+
+      - name: Package macOS arm64
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./nsh.json').version")"
+          nsh package . --target macos --arch arm64 --out dist/package
+          ditto -c -k --keepParent dist/package/Pi.app "dist/Pi-${version}-macos-arm64.zip"
+
+      - name: Package Windows x64
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content nsh.json -Raw | ConvertFrom-Json).version
+          nsh package . --target windows --out dist/package
+          $package = Get-ChildItem dist/package -Filter *.zip | Select-Object -First 1
+          if (-not $package) { throw "nsh did not produce a Windows zip" }
+          Copy-Item $package.FullName "dist/Pi-$version-windows-x64.zip"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/Pi-*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Pi ${GITHUB_REF_NAME#v}" \
+            --generate-notes
