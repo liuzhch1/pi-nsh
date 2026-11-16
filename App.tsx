@@ -23,10 +23,14 @@ import path from "path";
 import process from "process";
 import { Icon } from "./icons";
 import {
+  clampThinkingLevel,
   cleanSessionTitle,
   discoverProjects,
   loadCatalog,
   loadSessionHistory,
+  normalizeThinkingLevel,
+  normalizeThinkingLevels,
+  supportedThinkingLevels,
   type ContentBlock,
   type ModelInfo,
   type PiEvent,
@@ -38,6 +42,7 @@ import {
   scanProjectSessions,
   seedSessionCache,
   type SessionInfo,
+  type ThinkingLevel,
 } from "./pi";
 import { colors, content as contentMetrics, Press, roundButtonStyle, sidebar as sidebarMetrics, Spinner } from "./ui";
 
@@ -86,6 +91,9 @@ type ChatSession = {
   openMessageId: string | null;
   modelKey: string | null;
   modelChosen: boolean;
+  thinkingLevel: ThinkingLevel | null;
+  thinkingLevels: ThinkingLevel[];
+  thinkingChosen: boolean;
 };
 
 const PAGE_SIZE = 50;
@@ -126,6 +134,9 @@ function createChatSession(id: string, projectPath: string | null, path: string 
     openMessageId: null,
     modelKey: null,
     modelChosen: false,
+    thinkingLevel: null,
+    thinkingLevels: [],
+    thinkingChosen: false,
   };
 }
 
@@ -318,6 +329,10 @@ function App() {
   const modelKey = signal<string | null>(null);
   const modelChosen = signal(false);
   const modelOpen = signal(false);
+  const thinkingLevel = signal<ThinkingLevel | null>(null);
+  const thinkingLevels = signal<ThinkingLevel[]>([]);
+  const thinkingChosen = signal(false);
+  const thinkingOpen = signal(false);
   const addOpen = signal(false);
   const addPath = signal("");
   const addError = signal<string | null>(null);
@@ -387,6 +402,15 @@ function App() {
     Math.min(380, Math.max(56, modelGroups().reduce((total, group) => total + 24 + group.models.length * 28, 8))),
   );
 
+  const thinkingOptions = computed(() => {
+    const model = currentModel();
+    const available = model ? supportedThinkingLevels(model) : thinkingLevels();
+    const current = thinkingLevel();
+    return current && !available.includes(current) ? [current, ...available.filter((level) => level !== current)] : available;
+  });
+
+  const thinkingMenuHeight = computed(() => Math.min(240, Math.max(56, thinkingOptions().length * 28 + 32)));
+
   const toolResults = computed(() => {
     const results: Record<string, { text: string; isError: boolean }> = {};
     for (const message of messages()) {
@@ -429,6 +453,37 @@ function App() {
     models.update((list) => (list.some((item) => modelKeyOf(item) === key) ? list : [...list, model]));
     if (chat) chat.modelKey = key;
     if (!chat || chat === activeChat()) modelKey.set(key);
+  };
+
+  const applyThinking = (
+    chat: ChatSession,
+    level: ThinkingLevel | null | undefined,
+    levels?: ThinkingLevel[],
+    model: ModelInfo | null = null,
+  ) => {
+    if (level !== undefined) chat.thinkingLevel = level;
+    if (levels !== undefined) chat.thinkingLevels = levels.length ? levels : supportedThinkingLevels(model);
+    if (chat !== activeChat()) return;
+    thinkingLevel.set(chat.thinkingLevel);
+    thinkingLevels.set(chat.thinkingLevels);
+  };
+
+  const readThinkingLevels = async (client: PiClient, model: ModelInfo | null): Promise<ThinkingLevel[]> => {
+    try {
+      const available = await client.request<{ levels?: string[] }>("get_available_thinking_levels");
+      const levels = normalizeThinkingLevels(available?.levels);
+      return levels.length ? levels : supportedThinkingLevels(model);
+    } catch {
+      return supportedThinkingLevels(model);
+    }
+  };
+
+  const syncThinking = async (client: PiClient, chat: ChatSession) => {
+    const state = await client.request<{ model?: ModelInfo; thinkingLevel?: string }>("get_state");
+    applyModel(state?.model, chat);
+    const model = state?.model ?? models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+    const levels = await readThinkingLevels(client, model);
+    applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
   };
 
   const collapseAllWork = (chat = activeChat()) => {
@@ -506,11 +561,14 @@ function App() {
     try {
       const started = chat.client ?? (await ensureClient(chat));
       const [state, data] = await Promise.all([
-        started.request<{ model?: ModelInfo }>("get_state"),
+        started.request<{ model?: ModelInfo; thinkingLevel?: string }>("get_state"),
         started.request<{ messages?: PiMessage[] }>("get_messages"),
       ]);
       if (token !== undefined && token !== chat.loadToken) return;
       applyModel(state?.model, chat);
+      const model = state?.model ?? models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+      const levels = await readThinkingLevels(started, model);
+      applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
       const history = (data?.messages ?? []).map((message, index) => ({ ...message, id: `history-${index}-${message.timestamp ?? 0}` }));
       setChatState(chat, {
         messages: history,
@@ -551,6 +609,15 @@ function App() {
         const key = `${history.model.provider}/${history.model.id}`;
         chat.modelKey = key;
         if (chat === activeChat()) modelKey.set(key);
+      }
+      if (!chat.thinkingLevel && history.thinkingLevel) {
+        chat.thinkingLevel = history.thinkingLevel;
+        if (chat === activeChat()) thinkingLevel.set(history.thinkingLevel);
+      }
+      if (!chat.thinkingLevels.length) {
+        const model = models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+        chat.thinkingLevels = supportedThinkingLevels(model);
+        if (chat === activeChat()) thinkingLevels.set(chat.thinkingLevels);
       }
       trimChatStates();
     } catch {
@@ -640,6 +707,22 @@ function App() {
           set({ liveId: null });
         }
         chat.openMessageId = null;
+        break;
+      }
+      case "model_changed": {
+        applyModel(event.model as ModelInfo | undefined, chat);
+        if (chat.client) {
+          void syncThinking(chat.client, chat).catch((reason) => {
+            setChatState(chat, { error: errorText(reason) });
+          });
+        }
+        break;
+      }
+      case "thinking_level_changed": {
+        const level = normalizeThinkingLevel(event.level);
+        if (!level) break;
+        chat.thinkingLevel = level;
+        if (chat === activeChat()) thinkingLevel.set(level);
         break;
       }
       case "tool_execution_start": {
@@ -829,6 +912,11 @@ function App() {
     chat.lastUsed = Date.now();
     modelKey.set(chat.modelKey);
     modelChosen.set(chat.modelChosen);
+    const model = models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+    if (!chat.thinkingLevels.length) chat.thinkingLevels = supportedThinkingLevels(model);
+    thinkingLevel.set(chat.thinkingLevel);
+    thinkingLevels.set(chat.thinkingLevels);
+    thinkingChosen.set(chat.thinkingChosen);
     if (!chat.loaded) void loadChat(chat);
     else if (!chat.client) void revalidateChat(chat);
     evictClients();
@@ -839,6 +927,9 @@ function App() {
     if (chat === blankChat) return;
     chat.modelKey = modelKey();
     chat.modelChosen = modelChosen();
+    chat.thinkingLevel = thinkingLevel();
+    chat.thinkingLevels = thinkingLevels();
+    chat.thinkingChosen = thinkingChosen();
   };
 
   const adoptSessionPath = (chat: ChatSession, sessionPath: string) => {
@@ -904,6 +995,9 @@ function App() {
     const chat = createChatSession(id, projectPath ?? activeProject(), null);
     chat.modelKey = modelKey();
     chat.modelChosen = modelChosen();
+    chat.thinkingLevel = thinkingLevel();
+    chat.thinkingLevels = thinkingLevels();
+    chat.thinkingChosen = thinkingChosen();
     chats.set(id, chat);
     draftChatId.set(id);
     if (projectPath) {
@@ -912,6 +1006,7 @@ function App() {
     }
     activeSession.set(null);
     modelOpen.set(false);
+    thinkingOpen.set(false);
     evictClients();
   };
 
@@ -922,6 +1017,7 @@ function App() {
     const chat = activeChat();
     if (chat.state.running) return;
     modelOpen.set(false);
+    thinkingOpen.set(false);
     const projectPath = chat.projectPath ?? activeProject();
     if (!projectPath) {
       addOpen.set(true);
@@ -943,7 +1039,12 @@ function App() {
       if (!started) {
         setChatState(chat, { loading: true });
         started = await ensureClient(chat);
-        const state = await started.request<{ sessionFile?: string; messageCount?: number; model?: ModelInfo }>("get_state");
+        const state = await started.request<{
+          sessionFile?: string;
+          messageCount?: number;
+          model?: ModelInfo;
+          thinkingLevel?: string;
+        }>("get_state");
         if (state?.sessionFile && !chat.path) adoptSessionPath(chat, state.sessionFile);
         if (wasExisting && chat.path && typeof state?.messageCount === "number") {
           const historyCount = chat.state.messages.length - 1;
@@ -957,9 +1058,16 @@ function App() {
           }
         }
         applyModel(state?.model, chat);
+        const model = state?.model ?? models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+        const levels = await readThinkingLevels(started, model);
+        applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
         if (requestedModel && state?.model && modelKeyOf(requestedModel) !== modelKeyOf(state.model)) {
           await started.request("set_model", { provider: requestedModel.provider, modelId: requestedModel.id });
-          applyModel(requestedModel, chat);
+          await syncThinking(started, chat);
+        }
+        if (chat.thinkingChosen && chat.thinkingLevel) {
+          await started.request("set_thinking_level", { level: chat.thinkingLevel });
+          await syncThinking(started, chat);
         }
         setChatState(chat, { loading: false });
       }
@@ -993,20 +1101,56 @@ function App() {
     if (!value) return;
     if (activeChat() === blankChat) newChat();
     const chat = activeChat();
-    const previous = modelKey();
+    const previousKey = modelKey();
+    const previousLevel = chat.thinkingLevel;
+    const previousLevels = chat.thinkingLevels;
+    const previousModel = models().find((item) => modelMatchesKey(item, previousKey)) ?? null;
     modelKey.set(value);
     modelChosen.set(true);
     chat.modelKey = value;
     chat.modelChosen = true;
     const model = models().find((item) => modelKeyOf(item) === value);
-    if (model && chat.client) {
+    if (!model) return;
+    if (chat.client) {
       try {
         await chat.client.request("set_model", { provider: model.provider, modelId: model.id });
+        await syncThinking(chat.client, chat);
       } catch (reason) {
-        modelKey.set(previous);
-        chat.modelKey = previous;
+        modelKey.set(previousKey);
+        chat.modelKey = previousKey;
+        applyThinking(chat, previousLevel, previousLevels, previousModel);
         setChatState(chat, { error: errorText(reason) });
       }
+    } else {
+      const levels = supportedThinkingLevels(model);
+      const level = chat.thinkingLevel ? clampThinkingLevel(model, chat.thinkingLevel) : null;
+      applyThinking(chat, level, levels, model);
+    }
+  };
+
+  const chooseThinking = async (value: unknown) => {
+    const requested = normalizeThinkingLevel(value);
+    if (!requested) return;
+    if (activeChat() === blankChat) newChat();
+    const chat = activeChat();
+    const model = currentModel();
+    const level = clampThinkingLevel(model, requested);
+    const previousLevel = chat.thinkingLevel;
+    const previousLevels = chat.thinkingLevels;
+    const previousChosen = chat.thinkingChosen;
+    chat.thinkingLevel = level;
+    chat.thinkingChosen = true;
+    thinkingChosen.set(true);
+    applyThinking(chat, level, chat.thinkingLevels.length ? chat.thinkingLevels : supportedThinkingLevels(model), model);
+    if (!chat.client) return;
+    try {
+      await chat.client.request("set_thinking_level", { level });
+      await syncThinking(chat.client, chat);
+    } catch (reason) {
+      chat.thinkingChosen = previousChosen;
+      thinkingChosen.set(previousChosen);
+      applyThinking(chat, previousLevel, previousLevels, model);
+      setChatState(chat, { error: errorText(reason) });
     }
   };
 
@@ -1106,6 +1250,7 @@ function App() {
       activeSession.set(null);
       draftChatId.set(null);
       modelOpen.set(false);
+      thinkingOpen.set(false);
       draft.set("");
       inputHeight.set(22);
     }
@@ -1165,6 +1310,15 @@ function App() {
           const chat = activeChat();
           if (chat !== blankChat && !chat.modelKey) chat.modelKey = modelKey();
         }
+        if (!thinkingLevel()) {
+          const chat = activeChat();
+          if (chat !== blankChat && !chat.path && !chat.thinkingLevel) {
+            applyThinking(chat, catalog.thinkingLevel, catalog.thinkingLevels, catalog.defaultModel);
+          } else {
+            thinkingLevel.set(catalog.thinkingLevel);
+            thinkingLevels.set(catalog.thinkingLevels);
+          }
+        }
         piIssue.set(null);
       } catch (reason) {
         piIssue.set(errorText(reason));
@@ -1189,7 +1343,7 @@ function App() {
   });
 
   effect(() => {
-    if (modelOpen()) void loadModels();
+    if (modelOpen() || thinkingOpen()) void loadModels();
   });
 
   cleanup(
@@ -1748,7 +1902,10 @@ function App() {
     return (
       <Popover
         open={modelOpen()}
-        onOpenChange={({ open }) => modelOpen.set(open)}
+        onOpenChange={({ open }) => {
+          modelOpen.set(open);
+          if (open) thinkingOpen.set(false);
+        }}
         placement="top"
         align="start"
         offset={6}
@@ -1812,6 +1969,67 @@ function App() {
     );
   }
 
+  function ThinkingPicker() {
+    const title = computed(() => thinkingLevel() ?? "thinking");
+    return (
+      <Popover
+        open={thinkingOpen()}
+        onOpenChange={({ open }) => {
+          thinkingOpen.set(open);
+          if (open) modelOpen.set(false);
+        }}
+        placement="top"
+        align="start"
+        offset={6}
+        margin={10}
+        popupClass="rounded-xl border border-border bg-popover shadow-lg"
+        trigger={
+          <View
+            role="button"
+            accessibilityLabel={`Thinking level: ${title()}`}
+            style={{ height: 28, maxWidth: 150, borderRadius: 7, paddingHorizontal: 7, flexDirection: "row", alignItems: "center", gap: 5 }}
+            hoverStyle={{ backgroundColor: colors.accent }}
+          >
+            <Text style={{ numberOfLines: 1, textOverflow: "ellipsis", flexShrink: 1, fontSize: 11.5, color: colors.mutedText }}>
+              {title()}
+            </Text>
+            <Icon name="chevron-down" size={12} tint={colors.faint} />
+          </View>
+        }
+      >
+        <View style={{ width: 160, height: thinkingMenuHeight() }}>
+          <Scroll style={{ flex: 1, minHeight: 0 }} contentStyle={{ padding: 4 }} scrollbar>
+            <View style={{ height: 24, paddingHorizontal: 6, justifyContent: "center" }}>
+              <Text style={{ fontSize: 10, fontWeight: "600", letterSpacing: 0.4, color: colors.faint }}>THINKING</Text>
+            </View>
+            <Each of={thinkingOptions()}>
+              {(level) => (
+                <View
+                  onPress={() => {
+                    void chooseThinking(level());
+                    thinkingOpen.set(false);
+                  }}
+                  role="button"
+                  accessibilityLabel={`Use ${level()} thinking`}
+                  hoverStyle={{ backgroundColor: colors.accent }}
+                  activeStyle={{ opacity: 0.75 }}
+                  style={{ height: 28, borderRadius: 6, paddingHorizontal: 6, flexDirection: "row", alignItems: "center", gap: 8 }}
+                >
+                  <Text style={{ flex: 1, fontSize: 12.5, color: colors.text, fontWeight: thinkingLevel() === level() ? "500" : "400" }}>
+                    {level()}
+                  </Text>
+                  <If when={thinkingLevel() === level()}>
+                    <Icon name="check" size={12} tint={colors.text} />
+                  </If>
+                </View>
+              )}
+            </Each>
+          </Scroll>
+        </View>
+      </Popover>
+    );
+  }
+
   function Composer() {
     const canSend = computed(() => draft().trim().length > 0 && !running() && !loading());
     const placeholder = computed(() => {
@@ -1846,7 +2064,10 @@ function App() {
                 multiline
                 autoFocus
                 scrollbar={false}
-                onFocus={() => modelOpen.set(false)}
+                onFocus={() => {
+                  modelOpen.set(false);
+                  thinkingOpen.set(false);
+                }}
                 placeholder={placeholder()}
                 submitBehavior="submit"
                 onSubmit={() => void send()}
@@ -1863,10 +2084,11 @@ function App() {
                 }}
                 accessibilityLabel="Message pi"
               />
-              <If when={modelOpen()}>
+              <If when={modelOpen() || thinkingOpen()}>
                 <View
                   onPress={() => {
                     modelOpen.set(false);
+                    thinkingOpen.set(false);
                     composerInput?.focus();
                   }}
                   style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}
@@ -1875,6 +2097,7 @@ function App() {
             </View>
             <View style={{ height: 30, flexDirection: "row", alignItems: "center", gap: 7, paddingLeft: 2 }}>
               <ModelPicker />
+              <ThinkingPicker />
               <View style={{ flex: 1 }} />
               <If
                 when={running()}

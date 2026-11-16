@@ -3,10 +3,16 @@ import os from "os";
 import path from "path";
 import process from "process";
 
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 export interface ModelInfo {
   id: string;
   name: string;
   provider: string;
+  reasoning?: boolean;
+  thinkingLevelMap?: Record<string, string | null>;
 }
 
 export interface SessionInfo {
@@ -20,6 +26,7 @@ export interface SessionInfo {
 export interface SessionHistory {
   messages: PiMessage[];
   model: { provider: string; id: string } | null;
+  thinkingLevel: ThinkingLevel | null;
   mtimeMs: number;
   size: number;
 }
@@ -77,6 +84,45 @@ function projectName(value: string): string {
 
 export function projectFromPath(value: string): ProjectInfo {
   return { path: value, name: projectName(value) };
+}
+
+export function normalizeThinkingLevel(value: unknown): ThinkingLevel | null {
+  return typeof value === "string" && THINKING_LEVELS.includes(value as ThinkingLevel) ? (value as ThinkingLevel) : null;
+}
+
+export function normalizeThinkingLevels(value: unknown): ThinkingLevel[] {
+  if (!Array.isArray(value)) return [];
+  const levels: ThinkingLevel[] = [];
+  for (const item of value) {
+    const level = normalizeThinkingLevel(item);
+    if (level && !levels.includes(level)) levels.push(level);
+  }
+  return levels;
+}
+
+export function supportedThinkingLevels(model: ModelInfo | null | undefined): ThinkingLevel[] {
+  if (!model?.reasoning) return ["off"];
+  return THINKING_LEVELS.filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) return false;
+    if (level === "xhigh" || level === "max") return mapped !== undefined;
+    return true;
+  });
+}
+
+export function clampThinkingLevel(model: ModelInfo | null | undefined, level: ThinkingLevel): ThinkingLevel {
+  const levels = supportedThinkingLevels(model);
+  if (levels.includes(level)) return level;
+  const requestedIndex = THINKING_LEVELS.indexOf(level);
+  for (let index = requestedIndex; index < THINKING_LEVELS.length; index++) {
+    const candidate = THINKING_LEVELS[index];
+    if (levels.includes(candidate)) return candidate;
+  }
+  for (let index = requestedIndex - 1; index >= 0; index--) {
+    const candidate = THINKING_LEVELS[index];
+    if (levels.includes(candidate)) return candidate;
+  }
+  return levels[0] ?? "off";
 }
 
 function projectSessionDir(projectPath: string): string {
@@ -496,7 +542,7 @@ export async function loadSessionHistory(filePath: string): Promise<SessionHisto
   const header = records.find((record) => record.type === "session");
   if (!header) {
     if (text.trim()) throw new Error("Not a pi session file.");
-    return { messages: [], model: null, mtimeMs: stats.mtimeMs, size: stats.size };
+    return { messages: [], model: null, thinkingLevel: null, mtimeMs: stats.mtimeMs, size: stats.size };
   }
   const version = typeof header.version === "number" ? header.version : 1;
   if (version !== SUPPORTED_SESSION_VERSION) {
@@ -558,8 +604,12 @@ export async function loadSessionHistory(filePath: string): Promise<SessionHisto
   const messages = history.map((message, index) => ({ ...message, id: `history-${index}-${message.timestamp ?? 0}` }));
 
   let model: SessionHistory["model"] = null;
+  let thinkingLevel: SessionHistory["thinkingLevel"] = null;
   for (const entry of path) {
-    if (entry.type === "model_change" && typeof entry.provider === "string" && typeof entry.modelId === "string") {
+    if (entry.type === "thinking_level_change") {
+      const level = normalizeThinkingLevel(entry.thinkingLevel);
+      if (level) thinkingLevel = level;
+    } else if (entry.type === "model_change" && typeof entry.provider === "string" && typeof entry.modelId === "string") {
       model = { provider: entry.provider, id: entry.modelId };
     } else if (entry.type === "message") {
       const message = entry.message as PiMessage | undefined;
@@ -569,7 +619,7 @@ export async function loadSessionHistory(filePath: string): Promise<SessionHisto
     }
   }
 
-  return { messages, model, mtimeMs: stats.mtimeMs, size: stats.size };
+  return { messages, model, thinkingLevel, mtimeMs: stats.mtimeMs, size: stats.size };
 }
 
 export class PiClient {
@@ -719,7 +769,12 @@ export class PiClient {
   }
 }
 
-export async function loadCatalog(): Promise<{ models: ModelInfo[]; defaultModel: ModelInfo | null }> {
+export async function loadCatalog(): Promise<{
+  models: ModelInfo[];
+  defaultModel: ModelInfo | null;
+  thinkingLevel: ThinkingLevel | null;
+  thinkingLevels: ThinkingLevel[];
+}> {
   const client = new PiClient({
     projectPath: os.homedir(),
     noSession: true,
@@ -727,10 +782,22 @@ export async function loadCatalog(): Promise<{ models: ModelInfo[]; defaultModel
   });
   try {
     await client.start();
-    const state = await client.request<{ model?: ModelInfo }>("get_state");
-    const available = await client.request<{ models?: ModelInfo[] }>("get_available_models");
+    const [state, available] = await Promise.all([
+      client.request<{ model?: ModelInfo; thinkingLevel?: string }>("get_state"),
+      client.request<{ models?: ModelInfo[] }>("get_available_models"),
+    ]);
     const models = Array.isArray(available?.models) ? available.models : [];
-    return { models, defaultModel: state?.model ?? models[0] ?? null };
+    const defaultModel = state?.model ?? models[0] ?? null;
+    const thinking = await client
+      .request<{ levels?: string[] }>("get_available_thinking_levels")
+      .catch(() => ({ levels: [] as string[] }));
+    const thinkingLevels = normalizeThinkingLevels(thinking?.levels);
+    return {
+      models,
+      defaultModel,
+      thinkingLevel: normalizeThinkingLevel(state?.thinkingLevel),
+      thinkingLevels: thinkingLevels.length ? thinkingLevels : supportedThinkingLevels(defaultModel),
+    };
   } catch (error) {
     throw error instanceof Error ? error : new Error(String(error));
   } finally {
