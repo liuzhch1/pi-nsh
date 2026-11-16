@@ -52,6 +52,7 @@ export type PiMessage = {
   role: string;
   content: string | ContentBlock[];
   timestamp?: number;
+  durationMs?: number;
   stopReason?: string;
   errorMessage?: string;
   [key: string]: unknown;

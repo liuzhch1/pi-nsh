@@ -770,6 +770,27 @@ function App() {
         chat.openMessageId = null;
         break;
       }
+      case "agent_end": {
+        if (event.willRetry === true || !chat.client) break;
+        const client = chat.client;
+        setTimeout(() => {
+          if (generation !== chat.generation || !chat.state.running || chat.state.status) return;
+          void client
+            .request<{ isStreaming?: boolean; isCompacting?: boolean }>("get_state")
+            .then((state) => {
+              if (generation !== chat.generation || !chat.state.running || chat.state.status) return;
+              if (state?.isStreaming === false && state?.isCompacting === false) {
+                chat.liveAssistantId = null;
+                set({ running: false, liveId: null, status: null });
+                collapseAllWork(chat);
+                bumpSession(chat);
+                trimChatStates();
+              }
+            })
+            .catch(() => {});
+        }, 750);
+        break;
+      }
       case "model_changed": {
         applyModel(event.model as ModelInfo | undefined, chat);
         if (chat.client) {
@@ -1938,12 +1959,15 @@ function App() {
   function WorkDetails(props: { messages: () => PiMessage[]; turnKey: () => string; live: () => boolean }) {
     const blocks = computed(() => workBlocksOf(props.turnKey(), props.messages()));
     const open = computed(() => props.live() || !collapsed().has(props.turnKey()));
+    const duration = computed(() => {
+      const total = props.messages().reduce((sum, message) => sum + (typeof message.durationMs === "number" ? message.durationMs : 0), 0);
+      return total > 0 ? formatDuration(total) : "";
+    });
     const label = computed(() => {
       const parts: string[] = [];
-      const thinking = blocks().filter((block) => block.kind === "thinking").length;
       const tools = blocks().filter((block) => block.kind === "tool").length;
-      if (thinking) parts.push("Thinking");
       if (tools) parts.push(`${tools} tool${tools === 1 ? "" : "s"}`);
+      if (duration()) parts.push(duration());
       return parts.join(" · ");
     });
 
@@ -1964,7 +1988,9 @@ function App() {
           >
             <Icon name={open() ? "chevron-down" : "chevron-right"} size={12} tint={colors.faint} />
             <Text style={{ fontSize: 12, color: colors.mutedText }}>Work details</Text>
-            <Text style={{ fontSize: 12, color: colors.faint }}>{`· ${label()}`}</Text>
+            <If when={Boolean(label())}>
+              <Text style={{ fontSize: 12, color: colors.faint }}>{`· ${label()}`}</Text>
+            </If>
             <If when={props.live()}>
               <Spinner size={10} />
             </If>
@@ -2123,29 +2149,31 @@ function App() {
                 <Text style={{ fontSize: 14.5, lineHeight: 22, color: colors.text, userSelect: "text" }}>{text()}</Text>
               </View>
               <View style={{ alignSelf: "flex-end", height: 22, marginTop: 3, flexDirection: "row", alignItems: "center", gap: 2 }}>
-                <If when={hovering()}>
-                  <Press
-                    onPress={() => void copyMessage(message()!)}
-                    hoverStyle={{ backgroundColor: colors.accent }}
-                    activeStyle={{ opacity: 0.7 }}
-                    style={{ width: 22, height: 22, borderRadius: 5, alignItems: "center", justifyContent: "center" }}
-                    accessibilityLabel="Copy message"
-                    tooltip={<Text style={{ fontSize: 12 }}>Copy</Text>}
-                  >
-                    <Icon name={copiedMessageId() === message()?.id ? "check" : "copy"} size={13} tint={colors.mutedText} />
-                  </Press>
-                  <Press
-                    onPress={() => beginEditMessage(activeChat(), message()!)}
-                    disabled={running() || loading()}
-                    hoverStyle={{ backgroundColor: colors.accent }}
-                    activeStyle={{ opacity: 0.7 }}
-                    style={{ width: 22, height: 22, borderRadius: 5, alignItems: "center", justifyContent: "center" }}
-                    accessibilityLabel="Edit message"
-                    tooltip={<Text style={{ fontSize: 12 }}>Edit</Text>}
-                  >
-                    <Icon name="compose" size={13} tint={colors.mutedText} />
-                  </Press>
-                </If>
+                <View style={{ width: 44, height: 22, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 2 }}>
+                  <If when={hovering()}>
+                    <Press
+                      onPress={() => void copyMessage(message()!)}
+                      hoverStyle={{ backgroundColor: colors.accent }}
+                      activeStyle={{ opacity: 0.7 }}
+                      style={{ width: 22, height: 22, borderRadius: 5, alignItems: "center", justifyContent: "center" }}
+                      accessibilityLabel="Copy message"
+                      tooltip={<Text style={{ fontSize: 12 }}>Copy</Text>}
+                    >
+                      <Icon name={copiedMessageId() === message()?.id ? "check" : "copy"} size={13} tint={colors.mutedText} />
+                    </Press>
+                    <Press
+                      onPress={() => beginEditMessage(activeChat(), message()!)}
+                      disabled={running() || loading()}
+                      hoverStyle={{ backgroundColor: colors.accent }}
+                      activeStyle={{ opacity: 0.7 }}
+                      style={{ width: 22, height: 22, borderRadius: 5, alignItems: "center", justifyContent: "center" }}
+                      accessibilityLabel="Edit message"
+                      tooltip={<Text style={{ fontSize: 12 }}>Edit</Text>}
+                    >
+                      <Icon name="compose" size={13} tint={colors.mutedText} />
+                    </Press>
+                  </If>
+                </View>
                 <If when={Boolean(messageTime(message()?.timestamp))}>
                   <Text style={{ marginLeft: 3, fontSize: 10.5, color: colors.faint }}>{messageTime(message()?.timestamp)}</Text>
                 </If>
@@ -2221,18 +2249,20 @@ function App() {
         <If when={Boolean(error())}>
           <Text style={{ fontSize: 12, lineHeight: 18, color: colors.danger }}>{error()}</Text>
         </If>
-        <If when={showCopy()}>
-          <Press
-            onPress={() => void copyText(item().id, text())}
-            hoverStyle={{ backgroundColor: colors.accent }}
-            activeStyle={{ opacity: 0.7 }}
-            style={{ alignSelf: "flex-start", width: 22, height: 22, borderRadius: 5, alignItems: "center", justifyContent: "center" }}
-            accessibilityLabel="Copy message"
-            tooltip={<Text style={{ fontSize: 12 }}>Copy</Text>}
-          >
-            <Icon name={copiedMessageId() === item().id ? "check" : "copy"} size={13} tint={colors.mutedText} />
-          </Press>
-        </If>
+        <View style={{ alignSelf: "flex-start", width: 22, height: 22 }}>
+          <If when={showCopy()}>
+            <Press
+              onPress={() => void copyText(item().id, text())}
+              hoverStyle={{ backgroundColor: colors.accent }}
+              activeStyle={{ opacity: 0.7 }}
+              style={{ width: 22, height: 22, borderRadius: 5, alignItems: "center", justifyContent: "center" }}
+              accessibilityLabel="Copy message"
+              tooltip={<Text style={{ fontSize: 12 }}>Copy</Text>}
+            >
+              <Icon name={copiedMessageId() === item().id ? "check" : "copy"} size={13} tint={colors.mutedText} />
+            </Press>
+          </If>
+        </View>
       </View>
     );
   }
@@ -2458,6 +2488,7 @@ function App() {
                   <Press
                     onPress={() => void send()}
                     disabled={!canSend()}
+                    hoverStyle={{ backgroundColor: colors.primary, opacity: 0.9 }}
                     activeStyle={{ opacity: 0.82 }}
                     style={roundButtonStyle(30)}
                     accessibilityLabel="Send message"
@@ -2469,12 +2500,13 @@ function App() {
               >
                 <Press
                   onPress={() => void stop()}
+                  hoverStyle={{ backgroundColor: colors.text, opacity: 0.9 }}
                   activeStyle={{ opacity: 0.82 }}
                   style={[roundButtonStyle(30), { backgroundColor: colors.text }]}
                   accessibilityLabel="Stop"
                   tooltip={<Text style={{ fontSize: 12 }}>Stop</Text>}
                 >
-                  <Icon name="stop" size={12} tint={colors.onPrimary} />
+                  <Icon name="stop" size={13} tint={colors.onPrimary} />
                 </Press>
               </If>
             </View>

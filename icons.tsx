@@ -52,7 +52,7 @@ export function Icon(props: { name: IconName; size?: number; tint: string }) {
             break;
           case "stop":
             cx.beginPath();
-            cx.roundRect(7, 7, 10, 10, 2);
+            cx.roundRect(5, 5, 14, 14, 2.5);
             cx.fill();
             break;
           case "check":
