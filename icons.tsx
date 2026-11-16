@@ -10,6 +10,7 @@ export type IconName =
   | "stop"
   | "check"
   | "compose"
+  | "copy"
   | "panel-left";
 
 export function Icon(props: { name: IconName; size?: number; tint: string }) {
@@ -59,6 +60,9 @@ export function Icon(props: { name: IconName; size?: number; tint: string }) {
             break;
           case "compose":
             cx.stroke(new Path2D("M4 20h4l10.2-10.2a2.8 2.8 0 0 0-4-4L4 16zM13.5 6.5l4 4"));
+            break;
+          case "copy":
+            cx.stroke(new Path2D("M9 9h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1zM5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"));
             break;
           case "panel-left":
             cx.stroke(new Path2D("M4 4.5h16a1.5 1.5 0 0 1 1.5 1.5v12a1.5 1.5 0 0 1-1.5 1.5H4A1.5 1.5 0 0 1 2.5 18V6A1.5 1.5 0 0 1 4 4.5zM9 4.5v15"));

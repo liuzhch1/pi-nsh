@@ -39,6 +39,7 @@ open .nsh/out/Pi.app
 - Caches the session list, so the sidebar appears immediately on launch and refreshes behind it.
 - Checks the local history projection against pi's message count when a session starts, and falls back to pi's own history for a newer session format.
 - Streams assistant text, thinking, tool calls, and tool output.
+- Hover a sent message to copy it or edit it in place; an edit forks the session before that message and resends the revised text.
 - Collapses a finished turn's thinking and tool details automatically. Press the collapsed row to inspect them again.
 - Exposes the installed pi model catalog and each model's thinking levels from the composer, refreshing the catalog when the window regains focus.
 

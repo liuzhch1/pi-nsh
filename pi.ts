@@ -48,6 +48,7 @@ export type ContentBlock = {
 
 export type PiMessage = {
   id: string;
+  entryId?: string;
   role: string;
   content: string | ContentBlock[];
   timestamp?: number;
@@ -599,7 +600,11 @@ export async function loadSessionHistory(filePath: string): Promise<SessionHisto
     let messages = sessionEntryMessages(entry);
     const edit = typeof entry.id === "string" ? edits.get(entry.id) : undefined;
     if (edit !== undefined) messages = applyContextEdit(messages, edit);
-    for (const message of messages) history.push(trimHistoryMessage(message));
+    const entryId = typeof entry.id === "string" ? entry.id : undefined;
+    for (const message of messages) {
+      const trimmed = trimHistoryMessage(message);
+      history.push(entryId ? { ...trimmed, entryId } : trimmed);
+    }
   });
   const messages = history.map((message, index) => ({ ...message, id: `history-${index}-${message.timestamp ?? 0}` }));
 

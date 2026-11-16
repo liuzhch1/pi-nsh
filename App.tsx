@@ -73,6 +73,13 @@ type ChatState = {
   visibleCount: number;
 };
 
+type MessageEdit = {
+  chatId: string;
+  messageId: string;
+  draft: string;
+  saving: boolean;
+};
+
 type ChatSession = {
   id: string;
   path: string | null;
@@ -256,6 +263,27 @@ function oneLine(value: string, limit = 120): string {
   return text.length > limit ? `${text.slice(0, limit - 1).trimEnd()}…` : text;
 }
 
+function messageTime(timestamp: number | undefined): string {
+  if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) return "";
+  const date = new Date(timestamp);
+  const now = new Date();
+  const time = date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const dayNumber = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000;
+  const todayNumber = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / 86_400_000;
+  const daysAgo = todayNumber - dayNumber;
+  if (daysAgo <= 0) return time;
+  if (daysAgo < 7) {
+    const weekday = date.toLocaleDateString("en-US", { weekday: "long" });
+    return `${weekday} ${time}`;
+  }
+  const day = date.toLocaleDateString("en-US", {
+    ...(date.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }),
+    month: "short",
+    day: "numeric",
+  });
+  return `${day}, ${time}`;
+}
+
 function clipText(value: string, limit = 900): string {
   const text = value.trim();
   return text.length > limit ? `${text.slice(0, limit).trimEnd()}…` : text;
@@ -335,6 +363,9 @@ function App() {
   const thinkingLevels = signal<ThinkingLevel[]>([]);
   const thinkingChosen = signal(false);
   const thinkingOpen = signal(false);
+  const messageEdit = signal<MessageEdit | null>(null);
+  const editHeight = signal(48);
+  const copiedMessageId = signal<string | null>(null);
   const addOpen = signal(false);
   const addPath = signal("");
   const addError = signal<string | null>(null);
@@ -347,6 +378,7 @@ function App() {
   let addCardRef: ViewRef | undefined;
   let catalogLoading: Promise<void> | null = null;
   let expandedProjectsWrite = Promise.resolve();
+  let copiedTimer: ReturnType<typeof setTimeout> | null = null;
 
   let draftSequence = 0;
   const chats = new Map<string, ChatSession>();
@@ -425,6 +457,14 @@ function App() {
   });
 
   const displayItems = computed(() => buildTimeline(messages()));
+
+  const lastTurnId = computed(() => {
+    const items = displayItems();
+    for (let index = items.length - 1; index >= 0; index--) {
+      if (items[index].kind === "turn") return items[index].id;
+    }
+    return null;
+  });
 
   const visibleItems = computed(() => {
     const items = displayItems();
@@ -931,6 +971,8 @@ function App() {
 
   const activateChat = (chat: ChatSession) => {
     chat.lastUsed = Date.now();
+    messageEdit.set(null);
+    editHeight.set(48);
     modelKey.set(chat.modelKey);
     modelChosen.set(chat.modelChosen);
     const model = models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
@@ -1001,6 +1043,8 @@ function App() {
 
   const newChat = (projectPath?: string | null) => {
     rememberActiveModel();
+    messageEdit.set(null);
+    editHeight.set(48);
     const previous = activeChat();
     if (
       previous !== blankChat &&
@@ -1102,6 +1146,152 @@ function App() {
         messages: chat.state.messages.filter((message) => message.id !== localId),
       });
       if (chat === activeChat()) draft.set(text);
+    }
+  };
+
+  const copyText = async (id: string, text: string) => {
+    if (!text) return;
+    try {
+      await Clipboard.writeText(text);
+      copiedMessageId.set(id);
+      if (copiedTimer) clearTimeout(copiedTimer);
+      copiedTimer = setTimeout(() => {
+        copiedMessageId.set(null);
+        copiedTimer = null;
+      }, 1200);
+    } catch (reason) {
+      appError.set(`Could not copy message: ${errorText(reason)}`);
+    }
+  };
+
+  const copyMessage = (message: PiMessage) => copyText(message.id, textOfContent(message.content));
+
+  const beginEditMessage = (chat: ChatSession, message: PiMessage) => {
+    if (message.role !== "user" || chat.state.running || chat.state.loading) return;
+    const text = textOfContent(message.content);
+    messageEdit.set({ chatId: chat.id, messageId: message.id, draft: text, saving: false });
+    editHeight.set(Math.min(180, Math.max(48, text.split("\n").length * 22 + 18)));
+  };
+
+  const updateEditDraft = (value: string) => {
+    const current = messageEdit();
+    if (!current) return;
+    messageEdit.set({ ...current, draft: value });
+  };
+
+  const cancelEditMessage = () => {
+    if (messageEdit()?.saving) return;
+    messageEdit.set(null);
+    editHeight.set(48);
+  };
+
+  const resolveUserEntryId = async (client: PiClient, chat: ChatSession, message: PiMessage): Promise<string | null> => {
+    if (message.entryId) return message.entryId;
+    const data = await client.request<{ messages?: Array<{ entryId?: string; text?: string }> }>("get_fork_messages");
+    const candidates = (data?.messages ?? []).filter(
+      (item): item is { entryId: string; text: string } => typeof item.entryId === "string" && typeof item.text === "string",
+    );
+    const users = chat.state.messages.filter((item) => item.role === "user" && textOfContent(item.content).trim());
+    const targetIndex = users.findIndex((item) => item.id === message.id);
+    let candidateIndex = candidates.length - 1;
+    for (let index = users.length - 1; index >= 0; index--) {
+      const text = textOfContent(users[index].content).trim();
+      while (candidateIndex >= 0 && candidates[candidateIndex].text.trim() !== text) candidateIndex--;
+      if (candidateIndex < 0) break;
+      if (index === targetIndex) return candidates[candidateIndex].entryId;
+      candidateIndex--;
+    }
+    const text = textOfContent(message.content).trim();
+    for (let index = candidates.length - 1; index >= 0; index--) {
+      if (candidates[index].text.trim() === text) return candidates[index].entryId;
+    }
+    return null;
+  };
+
+  const saveEditedMessage = async () => {
+    const edit = messageEdit();
+    if (!edit || edit.saving) return;
+    const chat = chats.get(edit.chatId);
+    if (!chat || chat.state.running || chat.state.loading) return;
+    const text = edit.draft.trim();
+    if (!text) return;
+    const message = chat.state.messages.find((item) => item.id === edit.messageId && item.role === "user");
+    if (!message) {
+      messageEdit.set(null);
+      return;
+    }
+
+    messageEdit.set({ ...edit, saving: true });
+    let forked = false;
+    let forkedMessages: PiMessage[] | null = null;
+    try {
+      const client = chat.client ?? (await ensureClient(chat));
+      const entryId = await resolveUserEntryId(client, chat, message);
+      if (!entryId) throw new Error("Could not find that message in the pi session.");
+      const result = await client.request<{ text?: string; cancelled?: boolean }>("fork", { entryId });
+      if (result?.cancelled) throw new Error("Editing was cancelled.");
+      forked = true;
+
+      const state = await client.request<{ sessionFile?: string }>("get_state");
+      const nextSessionFile = state?.sessionFile ?? null;
+      if (nextSessionFile) {
+        try {
+          const loaded = await loadSessionHistory(nextSessionFile);
+          forkedMessages = loaded.messages;
+          chat.mtimeMs = loaded.mtimeMs;
+          chat.size = loaded.size;
+          chat.loadedAt = Date.now();
+        } catch {
+          const data = await client.request<{ messages?: PiMessage[] }>("get_messages");
+          forkedMessages = (data?.messages ?? []).map((item, index) => ({ ...item, id: `history-${index}-${item.timestamp ?? 0}` }));
+        }
+      } else {
+        const data = await client.request<{ messages?: PiMessage[] }>("get_messages");
+        forkedMessages = (data?.messages ?? []).map((item, index) => ({ ...item, id: `history-${index}-${item.timestamp ?? 0}` }));
+      }
+
+      const localId = newMessageId("local");
+      const optimistic: PiMessage = { id: localId, role: "user", content: text, timestamp: Date.now() };
+      chat.pendingUserId = localId;
+      chat.liveAssistantId = null;
+      chat.openMessageId = null;
+      chat.loaded = true;
+      setChatState(chat, {
+        messages: [...forkedMessages, optimistic],
+        toolRuns: {},
+        collapsed: collapsedTurnsOf(forkedMessages),
+        expandedBlocks: new Set(),
+        visibleCount: PAGE_SIZE,
+        running: true,
+        loading: false,
+        liveId: null,
+        error: null,
+        status: null,
+      });
+      if (nextSessionFile) adoptSessionPath(chat, nextSessionFile);
+      messageEdit.set(null);
+      editHeight.set(48);
+      await client.request("prompt", { message: text });
+    } catch (reason) {
+      chat.pendingUserId = null;
+      const detail = errorText(reason);
+      if (forked) {
+        messageEdit.set(null);
+        editHeight.set(48);
+        setChatState(chat, {
+          messages: forkedMessages ?? chat.state.messages,
+          running: false,
+          loading: false,
+          error: detail,
+        });
+        if (chat === activeChat()) {
+          draft.set(text);
+          inputHeight.set(22);
+        }
+      } else {
+        messageEdit.set({ ...edit, saving: false });
+        setChatState(chat, { running: false, loading: false, error: detail });
+      }
     }
   };
 
@@ -1273,6 +1463,7 @@ function App() {
       draftChatId.set(null);
       modelOpen.set(false);
       thinkingOpen.set(false);
+      messageEdit.set(null);
       draft.set("");
       inputHeight.set(22);
     }
@@ -1380,6 +1571,7 @@ function App() {
     for (const chat of chats.values()) closeChatClient(chat);
     clearTimeout(catalogTimer);
     clearInterval(poolTimer);
+    if (copiedTimer) clearTimeout(copiedTimer);
   });
 
   effect(() => {
@@ -1829,6 +2021,12 @@ function App() {
     const message = props.message;
     const role = computed(() => message()?.role ?? "");
     const text = computed(() => textOfContent(message()?.content));
+    const hovering = signal(false);
+    const editing = computed(() => {
+      const edit = messageEdit();
+      const current = message();
+      return edit && current && edit.chatId === activeChat().id && edit.messageId === current.id ? edit : null;
+    });
 
     if (!message()) return <View />;
 
@@ -1856,19 +2054,104 @@ function App() {
 
     if (role() === "user") {
       return (
-        <View style={{ width: "100%", maxWidth: contentMetrics.maxWidth, alignSelf: "center", paddingHorizontal: contentMetrics.padding, paddingVertical: 8 }}>
-          <View
-            style={{
-              alignSelf: "flex-end",
-              maxWidth: "80%",
-              backgroundColor: colors.muted,
-              borderRadius: 17,
-              paddingHorizontal: 13,
-              paddingVertical: 9,
-            }}
-          >
-            <Text style={{ fontSize: 14.5, lineHeight: 22, color: colors.text, userSelect: "text" }}>{text()}</Text>
-          </View>
+        <View>
+          <If when={Boolean(editing())}>
+            <View style={{ width: "100%", maxWidth: contentMetrics.maxWidth, alignSelf: "center", paddingHorizontal: contentMetrics.padding, paddingVertical: 8 }}>
+              <View style={{ width: "100%", borderRadius: 17, backgroundColor: colors.muted, paddingHorizontal: 13, paddingTop: 10, paddingBottom: 8, gap: 8 }}>
+                <Input
+                  value={editing()?.draft ?? ""}
+                  onChange={({ value }) => updateEditDraft(value)}
+                  multiline
+                  autoFocus
+                  scrollbar={false}
+                  submitBehavior="submit"
+                  onSubmit={() => void saveEditedMessage()}
+                  onContentSizeChange={({ size }) => editHeight.set(Math.min(180, Math.max(44, size.height)))}
+                  style={{
+                    height: editHeight() + 12,
+                    paddingHorizontal: 2,
+                    paddingVertical: 2,
+                    fontSize: 14.5,
+                    color: colors.text,
+                    placeholderColor: colors.faint,
+                    caretColor: colors.text,
+                    selectionColor: colors.accent,
+                  }}
+                  accessibilityLabel="Edit message"
+                />
+                <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: 8 }}>
+                  <Press
+                    onPress={cancelEditMessage}
+                    disabled={editing()?.saving}
+                    hoverStyle={{ backgroundColor: colors.secondary }}
+                    activeStyle={{ opacity: 0.8 }}
+                    style={{ height: 30, paddingHorizontal: 12, borderRadius: 8, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.card, alignItems: "center", justifyContent: "center" }}
+                    accessibilityLabel="Cancel editing"
+                  >
+                    <Text style={{ fontSize: 12.5, color: colors.text }}>Cancel</Text>
+                  </Press>
+                  <Press
+                    onPress={() => void saveEditedMessage()}
+                    disabled={editing()?.saving || !(editing()?.draft ?? "").trim()}
+                    hoverStyle={{ opacity: 0.88 }}
+                    activeStyle={{ opacity: 0.72 }}
+                    style={{ height: 30, paddingHorizontal: 14, borderRadius: 8, backgroundColor: colors.text, alignItems: "center", justifyContent: "center" }}
+                    accessibilityLabel="Send edited message"
+                  >
+                    <Text style={{ fontSize: 12.5, fontWeight: "500", color: colors.onPrimary }}>Send</Text>
+                  </Press>
+                </View>
+              </View>
+            </View>
+          </If>
+          <If when={!editing()}>
+            <View
+              onMouseEnter={() => hovering.set(true)}
+              onMouseLeave={() => hovering.set(false)}
+              style={{ width: "100%", maxWidth: contentMetrics.maxWidth, alignSelf: "center", paddingHorizontal: contentMetrics.padding, paddingVertical: 8 }}
+            >
+              <View
+                style={{
+                  alignSelf: "flex-end",
+                  maxWidth: "80%",
+                  backgroundColor: colors.muted,
+                  borderRadius: 17,
+                  paddingHorizontal: 13,
+                  paddingVertical: 9,
+                }}
+              >
+                <Text style={{ fontSize: 14.5, lineHeight: 22, color: colors.text, userSelect: "text" }}>{text()}</Text>
+              </View>
+              <View style={{ alignSelf: "flex-end", height: 22, marginTop: 3, flexDirection: "row", alignItems: "center", gap: 2 }}>
+                <If when={hovering()}>
+                  <Press
+                    onPress={() => void copyMessage(message()!)}
+                    hoverStyle={{ backgroundColor: colors.accent }}
+                    activeStyle={{ opacity: 0.7 }}
+                    style={{ width: 22, height: 22, borderRadius: 5, alignItems: "center", justifyContent: "center" }}
+                    accessibilityLabel="Copy message"
+                    tooltip={<Text style={{ fontSize: 12 }}>Copy</Text>}
+                  >
+                    <Icon name={copiedMessageId() === message()?.id ? "check" : "copy"} size={13} tint={colors.mutedText} />
+                  </Press>
+                  <Press
+                    onPress={() => beginEditMessage(activeChat(), message()!)}
+                    disabled={running() || loading()}
+                    hoverStyle={{ backgroundColor: colors.accent }}
+                    activeStyle={{ opacity: 0.7 }}
+                    style={{ width: 22, height: 22, borderRadius: 5, alignItems: "center", justifyContent: "center" }}
+                    accessibilityLabel="Edit message"
+                    tooltip={<Text style={{ fontSize: 12 }}>Edit</Text>}
+                  >
+                    <Icon name="compose" size={13} tint={colors.mutedText} />
+                  </Press>
+                </If>
+                <If when={Boolean(messageTime(message()?.timestamp))}>
+                  <Text style={{ marginLeft: 3, fontSize: 10.5, color: colors.faint }}>{messageTime(message()?.timestamp)}</Text>
+                </If>
+              </View>
+            </View>
+          </If>
         </View>
       );
     }
@@ -1890,6 +2173,7 @@ function App() {
 
   function TurnRow(props: { item: () => DisplayItem }) {
     const item = props.item;
+    const hovering = signal(false);
     const turnMessages = computed(() => {
       const value = item();
       return value.kind === "turn" ? value.messages : [];
@@ -1906,6 +2190,7 @@ function App() {
     );
     const hasDetails = computed(() => turnMessages().some((message) => hasWork(message)));
     const live = computed(() => turnMessages().some((message) => message.id === liveId()));
+    const showCopy = computed(() => Boolean(text().trim()) && (hovering() || lastTurnId() === item().id));
     const error = computed(() => {
       for (let index = turnMessages().length - 1; index >= 0; index--) {
         const message = turnMessages()[index];
@@ -1916,7 +2201,11 @@ function App() {
     });
 
     return (
-      <View style={{ width: "100%", maxWidth: contentMetrics.maxWidth, alignSelf: "center", paddingHorizontal: contentMetrics.padding, paddingVertical: 8, gap: 9 }}>
+      <View
+        onMouseEnter={() => hovering.set(true)}
+        onMouseLeave={() => hovering.set(false)}
+        style={{ width: "100%", maxWidth: contentMetrics.maxWidth, alignSelf: "center", paddingHorizontal: contentMetrics.padding, paddingVertical: 8, gap: 9 }}
+      >
         <If when={hasDetails()}>
           <WorkDetails messages={turnMessages} turnKey={turnKey} live={live} />
         </If>
@@ -1931,6 +2220,18 @@ function App() {
         </If>
         <If when={Boolean(error())}>
           <Text style={{ fontSize: 12, lineHeight: 18, color: colors.danger }}>{error()}</Text>
+        </If>
+        <If when={showCopy()}>
+          <Press
+            onPress={() => void copyText(item().id, text())}
+            hoverStyle={{ backgroundColor: colors.accent }}
+            activeStyle={{ opacity: 0.7 }}
+            style={{ alignSelf: "flex-start", width: 22, height: 22, borderRadius: 5, alignItems: "center", justifyContent: "center" }}
+            accessibilityLabel="Copy message"
+            tooltip={<Text style={{ fontSize: 12 }}>Copy</Text>}
+          >
+            <Icon name={copiedMessageId() === item().id ? "check" : "copy"} size={13} tint={colors.mutedText} />
+          </Press>
         </If>
       </View>
     );
