@@ -17,6 +17,7 @@ import {
   type ViewRef,
 } from "nsh";
 import { ContextMenu, Input, MenuItem, MenuSeparator, Popover, TextView } from "nsh/base";
+import { Window } from "nsh/desktop";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
@@ -1335,9 +1336,10 @@ function App() {
     }
   };
 
-  const loadModels = (): Promise<void> => {
+  const loadModels = (force = false): Promise<void> => {
     if (catalogLoading) return catalogLoading;
-    catalogLoading = (async () => {
+    if (!force && models().length) return Promise.resolve();
+    const pending = (async () => {
       try {
         const catalog = await loadCatalog();
         models.set(catalog.models);
@@ -1360,7 +1362,13 @@ function App() {
         piIssue.set(errorText(reason));
       }
     })();
-    return catalogLoading;
+    catalogLoading = pending;
+    void pending
+      .finally(() => {
+        if (catalogLoading === pending) catalogLoading = null;
+      })
+      .catch(() => {});
+    return pending;
   };
 
   void boot();
@@ -1380,6 +1388,14 @@ function App() {
 
   effect(() => {
     if (modelOpen() || thinkingOpen()) void loadModels();
+  });
+
+  effect(() => {
+    const mainWindow = Window.get("main");
+    if (!mainWindow) return;
+    return mainWindow.on("focusChange", ({ focused }) => {
+      if (focused) void loadModels(true);
+    });
   });
 
   cleanup(

@@ -40,7 +40,7 @@ open .nsh/out/Pi.app
 - Checks the local history projection against pi's message count when a session starts, and falls back to pi's own history for a newer session format.
 - Streams assistant text, thinking, tool calls, and tool output.
 - Collapses a finished turn's thinking and tool details automatically. Press the collapsed row to inspect them again.
-- Exposes the installed pi model catalog and each model's thinking levels from the composer.
+- Exposes the installed pi model catalog and each model's thinking levels from the composer, refreshing the catalog when the window regains focus.
 
 Projects are stored by the nsh app under its own app storage. Removing a project from the sidebar does not delete pi session files.
 
