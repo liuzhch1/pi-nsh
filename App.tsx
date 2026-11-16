@@ -48,6 +48,7 @@ import { colors, content as contentMetrics, Press, roundButtonStyle, sidebar as 
 
 const PROJECTS_KEY = "pi-nsh.projects.v2";
 const SESSIONS_KEY = "pi-nsh.sessions.v1";
+const EXPANDED_PROJECTS_KEY = "pi-nsh.expanded-projects.v1";
 const VISIBLE_SESSIONS = 5;
 
 type ToolRun = {
@@ -344,6 +345,7 @@ function App() {
   let composerInput: InputRef | undefined;
   let addCardRef: ViewRef | undefined;
   let catalogLoading: Promise<void> | null = null;
+  let expandedProjectsWrite = Promise.resolve();
 
   let draftSequence = 0;
   const chats = new Map<string, ChatSession>();
@@ -445,6 +447,24 @@ function App() {
     } catch (reason) {
       appError.set(`Could not save projects: ${errorText(reason)}`);
     }
+  };
+
+  const persistExpandedProjects = (list = expandedProjects()) => {
+    const value = JSON.stringify([...list]);
+    expandedProjectsWrite = expandedProjectsWrite
+      .catch(() => {})
+      .then(() => Storage.setItem(EXPANDED_PROJECTS_KEY, value))
+      .catch(() => {
+        // Folding still works for this session if the preference cannot be saved.
+      });
+  };
+
+  const setProjectExpanded = (projectPath: string, open: boolean) => {
+    const current = expandedProjects();
+    if (current.has(projectPath) === open) return;
+    const next = withSetValue(current, projectPath, open);
+    expandedProjects.set(next);
+    void persistExpandedProjects(next);
   };
 
   const applyModel = (model: ModelInfo | null | undefined, chat: ChatSession | null = null) => {
@@ -974,7 +994,7 @@ function App() {
     activeProject.set(projectPath);
     activeSession.set(sessionPath);
     draftChatId.set(null);
-    expandedProjects.update((set) => withSetValue(set, projectPath, true));
+    setProjectExpanded(projectPath, true);
     activateChat(chat);
   };
 
@@ -1002,7 +1022,7 @@ function App() {
     draftChatId.set(id);
     if (projectPath) {
       activeProject.set(projectPath);
-      expandedProjects.update((set) => withSetValue(set, projectPath, true));
+      setProjectExpanded(projectPath, true);
     }
     activeSession.set(null);
     modelOpen.set(false);
@@ -1172,7 +1192,7 @@ function App() {
   };
 
   const toggleProject = (projectPath: string) => {
-    expandedProjects.update((set) => withSetValue(set, projectPath, !set.has(projectPath)));
+    setProjectExpanded(projectPath, !expandedProjects().has(projectPath));
   };
 
   const chooseFolder = async () => {
@@ -1234,6 +1254,7 @@ function App() {
   const removeProject = async (projectPath: string) => {
     const next = projects().filter((project) => project.path !== projectPath);
     projects.set(next);
+    setProjectExpanded(projectPath, false);
     sessions.update((current) => {
       const copy = { ...current };
       delete copy[projectPath];
@@ -1271,6 +1292,18 @@ function App() {
         list = await discoverProjects();
         await Storage.setItem(PROJECTS_KEY, JSON.stringify(list));
       }
+      let storedExpanded: string[] | null = null;
+      try {
+        const raw = await Storage.getItem(EXPANDED_PROJECTS_KEY);
+        if (raw !== null) {
+          const parsed = JSON.parse(raw) as unknown;
+          if (Array.isArray(parsed)) {
+            storedExpanded = parsed.filter((path): path is string => typeof path === "string");
+          }
+        }
+      } catch {
+        storedExpanded = null;
+      }
       let cachedSessions: Record<string, SessionInfo[]> = {};
       try {
         const storedSessions = await Storage.getItem(SESSIONS_KEY);
@@ -1288,7 +1321,10 @@ function App() {
       sessions.set(cachedSessions);
       if (list.length) {
         activeProject.set(list[0].path);
-        expandedProjects.set(new Set(list.map((project) => project.path)));
+        const projectPaths = new Set(list.map((project) => project.path));
+        expandedProjects.set(
+          storedExpanded === null ? projectPaths : new Set(storedExpanded.filter((projectPath) => projectPaths.has(projectPath))),
+        );
       }
       booted.set(true);
       await refreshMany(list);

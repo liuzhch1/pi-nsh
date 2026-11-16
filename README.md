@@ -32,6 +32,7 @@ open .nsh/out/Pi.app
 
 - Discovers projects from pi's session store under `~/.pi/agent/sessions` on first launch, the home-directory project included.
 - Lets you add a project folder and toggle the last five chats of each project (`Show more` reveals the rest).
+- Remembers each project's expanded or collapsed sidebar state across launches.
 - Hover a project to reveal its new-chat action; right-click it to copy its path or remove it.
 - Opens a chat by reading its session file directly; `pi` starts on the first prompt and stays warm across switches (up to three chats, ten minutes idle), so a running turn keeps going when you switch away.
 - Pages older history in as you scroll up, and keeps the last eight visited chats in memory with a ten-minute freshness check.
