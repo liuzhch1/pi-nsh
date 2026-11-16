@@ -775,7 +775,7 @@ function App() {
   const startClient = async (chat: ChatSession): Promise<PiClient> => {
     if (!chat.projectPath) throw new Error("Choose a project first.");
     const generation = ++chat.generation;
-    let stderr = "";
+    const stderr: string[] = [];
     const next = new PiClient({
       projectPath: chat.projectPath,
       sessionPath: chat.path,
@@ -784,13 +784,17 @@ function App() {
         handleEvent(event, chat, generation);
       },
       onStderr: (line) => {
-        if (line.trim()) stderr = line.trim();
+        if (!line.trim()) return;
+        stderr.push(line.trim());
+        if (stderr.length > 20) stderr.shift();
       },
-      onExit: () => {
+      onExit: (code, detail) => {
         if (generation !== chat.generation) return;
         chat.client = null;
         chat.liveAssistantId = null;
-        setChatState(chat, { running: false, loading: false, liveId: null, error: stderr || "pi stopped unexpectedly." });
+        const output = detail || stderr.join("\n");
+        const status = code === null || code === undefined ? "pi stopped unexpectedly" : `pi exited with code ${code}`;
+        setChatState(chat, { running: false, loading: false, liveId: null, error: output ? `${status}\n${output}` : status });
       },
     });
     await next.start();

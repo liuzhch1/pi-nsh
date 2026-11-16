@@ -62,7 +62,7 @@ type ClientOptions = {
   noSession?: boolean;
   onEvent: (event: PiEvent) => void;
   onStderr?: (line: string) => void;
-  onExit?: (code: number | null | undefined) => void;
+  onExit?: (code: number | null | undefined, detail?: string) => void;
 };
 
 const SESSION_VERSION_ROOT = path.join(os.homedir(), ".pi", "agent", "sessions");
@@ -158,7 +158,15 @@ async function piCandidateDirs(): Promise<string[]> {
     path.join(home, ".cargo", "bin"),
     path.join(home, ".deno", "bin"),
     "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
     "/usr/local/bin",
+    "/usr/local/sbin",
+    "/opt/local/bin",
+    "/opt/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
   ];
 
   const prefix = await npmPrefixDir(home);
@@ -572,6 +580,9 @@ export class PiClient {
   private closed = false;
   private expectedExit = false;
   private startPromise: Promise<void> | null = null;
+  private launchPath = "";
+  private outputTail: string[] = [];
+  private exitReason: Error | null = null;
 
   constructor(options: ClientOptions) {
     this.options = options;
@@ -596,14 +607,12 @@ export class PiClient {
       stdin: "pipe",
       lines: true,
     } as const;
-    let child: ReturnType<typeof process.spawn>;
-    try {
-      child = process.spawn("pi", args, spawnOptions);
-    } catch (reason) {
-      if ((reason as { code?: string }).code !== "ENOENT") throw reason;
-      const resolution = await resolvedPi();
-      child = process.spawn("env", [`PATH=${resolution.pathValue}`, resolution.executable, ...args], spawnOptions);
-    }
+    const resolution = await resolvedPi();
+    this.launchPath = resolution.executable;
+    const child =
+      process.platform === "windows"
+        ? process.spawn(resolution.executable, args, spawnOptions)
+        : process.spawn("env", [`PATH=${resolution.pathValue}`, resolution.executable, ...args], spawnOptions);
     if (this.expectedExit) {
       child.kill();
       return;
@@ -611,23 +620,45 @@ export class PiClient {
     this.child = child;
 
     child.on("stdout", (line) => this.consume(line));
-    child.on("stderr", (line) => this.options.onStderr?.(line));
-    child.on("exit", ({ code }) => {
-      this.closed = true;
-      const error = new Error(`pi exited${code === null || code === undefined ? "" : ` with code ${code}`}`);
-      for (const pending of this.pending.values()) pending.reject(error);
-      this.pending.clear();
-      if (!this.expectedExit) this.options.onExit?.(code);
+    child.on("stderr", (line) => {
+      this.rememberOutput(line);
+      this.options.onStderr?.(line);
     });
+    child.on("exit", ({ code, signal, error }) => {
+      this.closed = true;
+      const status =
+        code === null || code === undefined
+          ? signal
+            ? ` from signal ${signal}`
+            : ""
+          : ` with code ${code}`;
+      const detail = [...this.outputTail, error ?? ""].filter((line) => line.trim()).join("\n");
+      const reason = new Error(`pi at ${this.launchPath} exited${status}${detail ? `\n${detail}` : ""}`);
+      this.exitReason = reason;
+      for (const pending of this.pending.values()) pending.reject(reason);
+      this.pending.clear();
+      if (!this.expectedExit) this.options.onExit?.(code, detail);
+    });
+  }
+
+  private rememberOutput(line: string): void {
+    const text = line.trim();
+    if (!text) return;
+    this.outputTail.push(text);
+    if (this.outputTail.length > 20) this.outputTail.shift();
   }
 
   private consume(line: string): void {
     const text = line.trim();
-    if (!text.startsWith("{")) return;
+    if (!text.startsWith("{")) {
+      this.rememberOutput(text);
+      return;
+    }
     let record: Record<string, unknown>;
     try {
       record = JSON.parse(text) as Record<string, unknown>;
     } catch {
+      this.rememberOutput(text);
       return;
     }
 
@@ -657,7 +688,8 @@ export class PiClient {
   }
 
   request<T = unknown>(type: string, data: Record<string, unknown> = {}): Promise<T> {
-    if (this.closed || !this.child) return Promise.reject(new Error("pi is not running"));
+    if (this.closed) return Promise.reject(this.exitReason ?? new Error("pi is not running"));
+    if (!this.child) return Promise.reject(new Error("pi is not running"));
     const id = `req-${++this.sequence}`;
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
