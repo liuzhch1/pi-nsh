@@ -391,21 +391,6 @@ function isStructuralBranchNode(node: BranchTreeNode): boolean {
   return !node.entry.role && !node.preview;
 }
 
-function visibleBranchRowCount(nodes: BranchTreeNode[]): number {
-  let count = 0;
-  const stack = [...nodes];
-  while (stack.length) {
-    const node = stack.pop()!;
-    if (isStructuralBranchNode(node)) {
-      for (const child of node.children) stack.push(child);
-      continue;
-    }
-    count++;
-    for (const child of node.children) stack.push(child);
-  }
-  return count;
-}
-
 function sessionTreeEntryById(nodes: SessionTreeNode[], id: string): SessionTreeNode | null {
   const stack = [...nodes];
   while (stack.length) {
@@ -518,18 +503,12 @@ function App() {
     return groups;
   });
 
-  const modelMenuHeight = computed(() =>
-    Math.min(380, Math.max(56, modelGroups().reduce((total, group) => total + 24 + group.models.length * 28, 8))),
-  );
-
   const thinkingOptions = computed(() => {
     const model = currentModel();
     const available = model ? supportedThinkingLevels(model) : thinkingLevels();
     const current = thinkingLevel();
     return current && !available.includes(current) ? [current, ...available.filter((level) => level !== current)] : available;
   });
-
-  const thinkingMenuHeight = computed(() => Math.min(240, Math.max(56, thinkingOptions().length * 28 + 32)));
 
   const toolResults = computed(() => {
     const results: Record<string, { text: string; isError: boolean }> = {};
@@ -2696,10 +2675,9 @@ function App() {
     const topLevel = computed(() => topLevelBranchNodes(branchTree()));
     const activePath = computed(() => branchPathIds(branchTree(), branchLeafId()));
     const locked = computed(() => running() || loading() || branchBusy());
-    const treeHeight = computed(() => {
-      const rows = visibleBranchRowCount(topLevel());
+    const scrollMaxHeight = computed(() => {
       const notices = (branchError() ? 21 : 0) + (locked() && sessionHasBranches() ? 18 : 0);
-      return rows ? Math.min(360, 32 + rows * 26 + notices) : 80;
+      return 328 - notices;
     });
     return (
       <Popover
@@ -2732,8 +2710,8 @@ function App() {
           </View>
         }
       >
-        <View style={{ width: 340, height: treeHeight() }}>
-          <View style={{ flex: 1, minHeight: 0, paddingTop: 4, paddingHorizontal: 4 }}>
+        <View style={{ width: 340 }}>
+          <View style={{ paddingTop: 4, paddingHorizontal: 4, paddingBottom: 4 }}>
             <View style={{ height: 24, paddingHorizontal: 2, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
               <Text style={{ fontSize: 10, fontWeight: "600", letterSpacing: 0.4, color: colors.faint }}>SESSION TREE</Text>
               <If when={branchBusy()}>
@@ -2749,11 +2727,11 @@ function App() {
             <If when={topLevel().length > 0} else={
               <View style={{ paddingHorizontal: 2, paddingTop: 3, paddingBottom: 6 }}>
                 <Text style={{ paddingHorizontal: 6, fontSize: 11.5, lineHeight: 17, color: colors.mutedText }}>
-                  No branches yet. Edit a message or fork a response to create one.
+                  No branches yet. Edit a message to create one.
                 </Text>
               </View>
             }>
-              <Scroll style={{ flex: 1, minHeight: 0 }} contentStyle={{ paddingBottom: 4 }} scrollbar>
+              <Scroll style={{ maxHeight: scrollMaxHeight(), flexShrink: 1 }} contentStyle={{ paddingBottom: 4 }} scrollbar>
               <Each of={topLevel()}>
                 {(node) => (
                   <BranchTreeNodeView
@@ -2806,8 +2784,8 @@ function App() {
           </View>
         }
       >
-        <View style={{ width: 280, height: modelMenuHeight() }}>
-          <Scroll style={{ flex: 1, minHeight: 0 }} contentStyle={{ padding: 4 }} scrollbar>
+        <View style={{ width: 280 }}>
+          <Scroll style={{ maxHeight: 372, flexShrink: 1 }} contentStyle={{ padding: 4 }} scrollbar>
             <If when={models().length === 0}>
               <View style={{ height: 32, paddingHorizontal: 8, justifyContent: "center" }}>
                 <Text style={{ fontSize: 12, numberOfLines: 1, textOverflow: "ellipsis", color: colors.faint }}>
@@ -2883,8 +2861,8 @@ function App() {
           </View>
         }
       >
-        <View style={{ width: 160, height: thinkingMenuHeight() }}>
-          <Scroll style={{ flex: 1, minHeight: 0 }} contentStyle={{ padding: 4 }} scrollbar>
+        <View style={{ width: 160 }}>
+          <Scroll style={{ maxHeight: 232, flexShrink: 1 }} contentStyle={{ padding: 4 }} scrollbar>
             <View style={{ height: 24, paddingHorizontal: 6, justifyContent: "center" }}>
               <Text style={{ fontSize: 10, fontWeight: "600", letterSpacing: 0.4, color: colors.faint }}>THINKING</Text>
             </View>
@@ -3151,7 +3129,8 @@ function App() {
             role="dialog"
             accessibilityLabel="Add project"
             style={{
-              width: 520,
+              width: "100%",
+              maxWidth: 520,
               borderRadius: 16,
               borderWidth: 1,
               borderColor: colors.border,
