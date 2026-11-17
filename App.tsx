@@ -35,6 +35,7 @@ import {
   normalizeThinkingLevel,
   normalizeThinkingLevels,
   projectBranchTree,
+  readGitBranch,
   supportedThinkingLevels,
   type BranchTreeNode,
   type ContentBlock,
@@ -439,6 +440,7 @@ function App() {
   const thinkingLevels = signal<ThinkingLevel[]>([]);
   const thinkingChosen = signal(false);
   const thinkingOpen = signal(false);
+  const gitBranch = signal<string | null>(null);
   const branchOpen = signal(false);
   const forkingTurnId = signal<string | null>(null);
   const messageEdit = signal<MessageEdit | null>(null);
@@ -1844,6 +1846,18 @@ function App() {
   // The catalog needs its own pi process; let the first chat open first.
   const catalogTimer = setTimeout(() => void loadModels(), 1500);
   const poolTimer = setInterval(evictClients, 60_000);
+  let gitBranchRequest = 0;
+
+  const refreshGitBranch = async () => {
+    const request = ++gitBranchRequest;
+    const projectPath = activeProject();
+    if (!projectPath) {
+      gitBranch.set(null);
+      return;
+    }
+    const branch = await readGitBranch(projectPath).catch(() => null);
+    if (request === gitBranchRequest) gitBranch.set(branch);
+  };
 
   cleanup(() => {
     for (const chat of chats.values()) closeChatClient(chat);
@@ -1861,10 +1875,17 @@ function App() {
   });
 
   effect(() => {
+    void refreshGitBranch();
+  });
+
+  effect(() => {
     const mainWindow = Window.get("main");
     if (!mainWindow) return;
     return mainWindow.on("focusChange", ({ focused }) => {
-      if (focused) void loadModels(true);
+      if (focused) {
+        void loadModels(true);
+        void refreshGitBranch();
+      }
     });
   });
 
@@ -2122,6 +2143,9 @@ function App() {
             <Spinner size={11} />
             <Text style={{ fontSize: 11, color: colors.faint }}>{status() ?? (loading() ? "Loading" : "Working")}</Text>
           </View>
+        </If>
+        <If when={Boolean(session())}>
+          <BranchPicker />
         </If>
       </View>
     );
@@ -2687,8 +2711,8 @@ function App() {
             thinkingOpen.set(false);
           }
         }}
-        placement="top"
-        align="start"
+        placement="bottom"
+        align="end"
         offset={6}
         margin={10}
         popupClass="rounded-xl border border-border bg-popover shadow-lg"
@@ -2697,11 +2721,11 @@ function App() {
             role="button"
             accessibilityLabel="Session branches"
             accessibilityState={{ expanded: branchOpen() }}
-            style={{ width: 112, height: 28, flexShrink: 0, borderRadius: 7, paddingHorizontal: 7, flexDirection: "row", alignItems: "center", gap: 5 }}
+            style={{ height: 28, flexShrink: 0, borderRadius: 7, paddingHorizontal: 8, flexDirection: "row", alignItems: "center", gap: 5 }}
             hoverStyle={{ backgroundColor: colors.accent }}
           >
             <Icon name="branch" size={12} tint={sessionHasBranches() ? colors.text : colors.faint} />
-            <Text style={{ numberOfLines: 1, textOverflow: "ellipsis", flexShrink: 1, fontSize: 11.5, color: colors.mutedText }}>
+            <Text style={{ numberOfLines: 1, flexShrink: 0, fontSize: 11.5, color: colors.mutedText }}>
               Branches
             </Text>
             <Icon name="chevron-down" size={12} tint={colors.faint} />
@@ -2962,7 +2986,17 @@ function App() {
             <View style={{ height: 30, flexDirection: "row", alignItems: "center", gap: 7, paddingLeft: 2 }}>
               <ModelPicker />
               <ThinkingPicker />
-              <BranchPicker />
+              <If when={Boolean(gitBranch())}>
+                <View
+                  accessibilityLabel={`Git branch ${gitBranch()}`}
+                  style={{ height: 28, maxWidth: 180, flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 5 }}
+                >
+                  <Icon name="branch" size={12} tint={colors.faint} />
+                  <Text style={{ numberOfLines: 1, textOverflow: "ellipsis", fontFamily: "Menlo", fontSize: 10.5, color: colors.faint }}>
+                    {gitBranch()}
+                  </Text>
+                </View>
+              </If>
               <View style={{ flex: 1 }} />
               <If
                 when={running()}

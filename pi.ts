@@ -135,6 +135,40 @@ export function projectFromPath(value: string): ProjectInfo {
   return { path: value, name: projectName(value) };
 }
 
+export async function readGitBranch(projectPath: string): Promise<string | null> {
+  let dir = projectPath;
+  let gitDir: string | null = null;
+  while (!gitDir) {
+    const candidate = path.join(dir, ".git");
+    let exists = true;
+    try {
+      await fs.stat(candidate);
+    } catch {
+      exists = false;
+    }
+    if (exists) {
+      try {
+        const pointer = await fs.readFile(candidate, "utf8");
+        const match = /^gitdir:\s*(.+)$/m.exec(pointer);
+        gitDir = match ? path.resolve(dir, match[1].trim()) : candidate;
+      } catch {
+        gitDir = candidate;
+      }
+      break;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+
+  try {
+    const head = await fs.readFile(path.join(gitDir, "HEAD"), "utf8");
+    return /^ref:\s+refs\/heads\/(.+)$/m.exec(head)?.[1]?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 export function normalizeThinkingLevel(value: unknown): ThinkingLevel | null {
   return typeof value === "string" && THINKING_LEVELS.includes(value as ThinkingLevel) ? (value as ThinkingLevel) : null;
 }

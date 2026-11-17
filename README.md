@@ -41,7 +41,8 @@ open .nsh/out/Pi.app
 - Streams assistant text, thinking, tool calls, and tool output.
 - Hover a sent message to copy it or edit it in place; an edit branches from that message inside the same pi session and resends the revised text.
 - Hover an assistant response to copy it or fork the conversation at that response into a new chat.
-- Open the branch tree from the composer to see every branch in the current session and switch the active leaf when pi is idle.
+- Open the branch tree from the chat header to see every branch in the current session and switch the active leaf when pi is idle.
+- Shows the current project's checked-out Git branch in the composer when the project is inside a repository.
 - Collapses a finished turn's thinking and tool details automatically. Press the collapsed row to inspect them again.
 - Exposes the installed pi model catalog and each model's thinking levels from the composer, refreshing the catalog when the window regains focus.
 
