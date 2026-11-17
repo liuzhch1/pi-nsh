@@ -11,6 +11,7 @@ export type IconName =
   | "check"
   | "compose"
   | "copy"
+  | "branch"
   | "panel-left";
 
 export function Icon(props: { name: IconName; size?: number; tint: string }) {
@@ -63,6 +64,15 @@ export function Icon(props: { name: IconName; size?: number; tint: string }) {
             break;
           case "copy":
             cx.stroke(new Path2D("M9 9h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1zM5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"));
+            break;
+          case "branch":
+            cx.stroke(new Path2D("M6 3v12M18 9a9 9 0 0 1-9 9"));
+            cx.beginPath();
+            cx.arc(18, 6, 3, 0, Math.PI * 2);
+            cx.stroke();
+            cx.beginPath();
+            cx.arc(6, 18, 3, 0, Math.PI * 2);
+            cx.stroke();
             break;
           case "panel-left":
             cx.stroke(new Path2D("M4 4.5h16a1.5 1.5 0 0 1 1.5 1.5v12a1.5 1.5 0 0 1-1.5 1.5H4A1.5 1.5 0 0 1 2.5 18V6A1.5 1.5 0 0 1 4 4.5zM9 4.5v15"));

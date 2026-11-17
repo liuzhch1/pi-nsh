@@ -27,6 +27,8 @@ export interface SessionHistory {
   messages: PiMessage[];
   model: { provider: string; id: string } | null;
   thinkingLevel: ThinkingLevel | null;
+  tree: SessionTreeNode[];
+  leafId: string | null;
   mtimeMs: number;
   size: number;
 }
@@ -58,6 +60,29 @@ export type PiMessage = {
   [key: string]: unknown;
 };
 
+export type SessionTreeEntry = {
+  id: string;
+  parentId: string | null;
+  type: string;
+  timestamp?: string;
+  role?: string;
+  message?: PiMessage;
+  [key: string]: unknown;
+};
+
+export type SessionTreeNode = {
+  entry: SessionTreeEntry;
+  children: SessionTreeNode[];
+  label?: string;
+};
+
+export type BranchTreeNode = {
+  entry: SessionTreeEntry;
+  children: BranchTreeNode[];
+  compressedEntryIds?: string[];
+  preview?: string;
+};
+
 export type PiEvent = Record<string, unknown> & { type: string };
 
 type Pending = {
@@ -75,6 +100,28 @@ type ClientOptions = {
 };
 
 const SESSION_VERSION_ROOT = path.join(os.homedir(), ".pi", "agent", "sessions");
+export const BRANCH_NAVIGATE_COMMAND = "nsh-navigate-tree";
+export const BRANCH_FORK_AT_COMMAND = "nsh-fork-at";
+const BRANCH_EXTENSION_SOURCE = `export default function piNshBranch(pi) {
+  pi.registerCommand("${BRANCH_NAVIGATE_COMMAND}", {
+    description: "Move the session leaf for the Pi desktop client",
+    handler: async (args, ctx) => {
+      const targetId = String(args || "").trim();
+      if (!targetId) throw new Error("Missing target entry id");
+      await ctx.navigateTree(targetId, {});
+    },
+  });
+  pi.registerCommand("${BRANCH_FORK_AT_COMMAND}", {
+    description: "Fork the session at an entry for the Pi desktop client",
+    handler: async (args, ctx) => {
+      const targetId = String(args || "").trim();
+      if (!targetId) throw new Error("Missing target entry id");
+      await ctx.fork(targetId, { position: "at" });
+    },
+  });
+}
+`;
+let branchExtensionPromise: Promise<string> | null = null;
 type PiResolution = { executable: string; pathValue: string };
 let piResolutionPromise: Promise<PiResolution> | null = null;
 
@@ -271,6 +318,26 @@ function resolvedPi(): Promise<PiResolution> {
     );
   }
   return piResolutionPromise;
+}
+
+function branchExtension(): Promise<string> {
+  if (!branchExtensionPromise) {
+    branchExtensionPromise = (async () => {
+      const dir = path.join(os.homedir(), ".pi", "pi-nsh");
+      const extensionPath = path.join(dir, "branch-extension.mjs");
+      await fs.mkdir(dir, { recursive: true });
+      let current = "";
+      try {
+        current = await fs.readFile(extensionPath, "utf8");
+      } catch {}
+      if (current !== BRANCH_EXTENSION_SOURCE) await fs.writeFile(extensionPath, BRANCH_EXTENSION_SOURCE);
+      return extensionPath;
+    })().catch((reason) => {
+      branchExtensionPromise = null;
+      throw reason;
+    });
+  }
+  return branchExtensionPromise;
 }
 
 export function cleanSessionTitle(value: string): string {
@@ -533,6 +600,112 @@ function trimHistoryMessage(message: PiMessage): PiMessage {
   return trimmed ? { ...message, content } : message;
 }
 
+function buildSessionTree(entries: Record<string, unknown>[]): { tree: SessionTreeNode[]; leafId: string | null } {
+  const nodes = new Map<string, SessionTreeNode>();
+  const ordered: SessionTreeNode[] = [];
+  for (const record of entries) {
+    if (typeof record.id !== "string") continue;
+    const entry = record as SessionTreeEntry;
+    entry.parentId = typeof entry.parentId === "string" ? entry.parentId : null;
+    const node: SessionTreeNode = { entry, children: [] };
+    nodes.set(entry.id, node);
+    ordered.push(node);
+  }
+
+  const roots: SessionTreeNode[] = [];
+  for (const node of ordered) {
+    const parent = node.entry.parentId ? nodes.get(node.entry.parentId) : undefined;
+    if (parent) parent.children.push(node);
+    else roots.push(node);
+  }
+
+  const last = entries[entries.length - 1];
+  return { tree: roots, leafId: typeof last?.id === "string" ? last.id : null };
+}
+
+const BRANCH_PREVIEW_LIMIT = 120;
+
+function branchPreview(entry: SessionTreeEntry): { text: string; role?: string } | null {
+  if (entry.type !== "message" || !entry.message || entry.message.role === "system") return null;
+  let text = "";
+  let hasImage = false;
+  const content = entry.message.content;
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block.type === "image") hasImage = true;
+      if (block.type === "text" && typeof block.text === "string") text += `${text ? " " : ""}${block.text}`;
+      if (text.length > BRANCH_PREVIEW_LIMIT) break;
+    }
+  }
+  text = text.replace(/\s+/g, " ").trim();
+  if (text.length > BRANCH_PREVIEW_LIMIT) text = `${text.slice(0, BRANCH_PREVIEW_LIMIT)}…`;
+  if (!text) {
+    text = hasImage ? "[image]" : entry.message.role === "assistant" ? "[assistant]" : "message";
+  }
+  const role = entry.message.role === "user" || entry.message.role === "assistant" ? entry.message.role : undefined;
+  return { text, role };
+}
+
+/**
+ * Contracts linear history into a compact navigation tree. Roots, branch
+ * points and leaves remain visible; the ids skipped between them stay attached
+ * to the next visible node so the active leaf can still be recognized.
+ */
+export function projectBranchTree(nodes: SessionTreeNode[]): BranchTreeNode[] {
+  if (!nodes.length) return [];
+  const roots = new Set(nodes);
+  const keep = new Set<SessionTreeNode>();
+  const stack = [...nodes];
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (roots.has(node) || node.children.length !== 1) keep.add(node);
+    for (const child of node.children) stack.push(child);
+  }
+
+  const project = (source: SessionTreeNode, compressed: string[], preview: { text: string; role?: string } | null): BranchTreeNode => {
+    const entry: SessionTreeEntry = {
+      id: source.entry.id,
+      parentId: source.entry.parentId,
+      type: source.entry.type,
+      ...(source.entry.timestamp ? { timestamp: source.entry.timestamp } : {}),
+      ...(preview?.role ? { role: preview.role } : {}),
+    };
+    const projected: BranchTreeNode = {
+      entry,
+      children: [],
+      ...(compressed.length ? { compressedEntryIds: compressed } : {}),
+      ...(preview?.text ? { preview: preview.text } : {}),
+    };
+    for (const sourceChild of source.children) {
+      let child = sourceChild;
+      const skipped: string[] = [];
+      let childPreview = branchPreview(child.entry);
+      while (!keep.has(child) && child.children.length === 1) {
+        skipped.push(child.entry.id);
+        child = child.children[0];
+        childPreview ??= branchPreview(child.entry);
+      }
+      if (keep.has(child)) projected.children.push(project(child, skipped, childPreview));
+    }
+    return projected;
+  };
+
+  return nodes.map((node) => project(node, [], branchPreview(node.entry)));
+}
+
+export function hasSessionBranches(nodes: BranchTreeNode[]): boolean {
+  if (nodes.length > 1) return true;
+  const stack = [...nodes];
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (node.children.length > 1) return true;
+    for (const child of node.children) stack.push(child);
+  }
+  return false;
+}
+
 /**
  * Reads a session file the way pi resumes it: the entries on the current leaf
  * path, with compaction and context edits applied. This keeps opening a chat
@@ -544,13 +717,14 @@ export async function loadSessionHistory(filePath: string): Promise<SessionHisto
   const header = records.find((record) => record.type === "session");
   if (!header) {
     if (text.trim()) throw new Error("Not a pi session file.");
-    return { messages: [], model: null, thinkingLevel: null, mtimeMs: stats.mtimeMs, size: stats.size };
+    return { messages: [], model: null, thinkingLevel: null, tree: [], leafId: null, mtimeMs: stats.mtimeMs, size: stats.size };
   }
   const version = typeof header.version === "number" ? header.version : 1;
   if (version !== SUPPORTED_SESSION_VERSION) {
     throw new Error(`Unsupported pi session version ${version}; this build reads ${SUPPORTED_SESSION_VERSION}.`);
   }
   const entries = records.filter((record) => record.type !== "session");
+  const { tree, leafId } = buildSessionTree(entries);
 
   const byId = new Map<string, Record<string, unknown>>();
   for (const entry of entries) {
@@ -625,7 +799,7 @@ export async function loadSessionHistory(filePath: string): Promise<SessionHisto
     }
   }
 
-  return { messages, model, thinkingLevel, mtimeMs: stats.mtimeMs, size: stats.size };
+  return { messages, model, thinkingLevel, tree, leafId, mtimeMs: stats.mtimeMs, size: stats.size };
 }
 
 export class PiClient {
@@ -657,6 +831,9 @@ export class PiClient {
     const args = ["--mode", "rpc"];
     if (this.options.noSession) args.push("--no-session");
     else if (this.options.sessionPath) args.push("--session", this.options.sessionPath);
+    if (!this.options.noSession) {
+      args.push("--extension", await branchExtension());
+    }
 
     const spawnOptions = {
       cwd: this.options.projectPath,

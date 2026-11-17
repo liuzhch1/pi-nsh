@@ -24,14 +24,19 @@ import path from "path";
 import process from "process";
 import { Icon } from "./icons";
 import {
+  BRANCH_FORK_AT_COMMAND,
+  BRANCH_NAVIGATE_COMMAND,
   clampThinkingLevel,
   cleanSessionTitle,
   discoverProjects,
+  hasSessionBranches,
   loadCatalog,
   loadSessionHistory,
   normalizeThinkingLevel,
   normalizeThinkingLevels,
+  projectBranchTree,
   supportedThinkingLevels,
+  type BranchTreeNode,
   type ContentBlock,
   type ModelInfo,
   type PiEvent,
@@ -43,6 +48,8 @@ import {
   scanProjectSessions,
   seedSessionCache,
   type SessionInfo,
+  type SessionTreeEntry,
+  type SessionTreeNode,
   type ThinkingLevel,
 } from "./pi";
 import { colors, content as contentMetrics, Press, roundButtonStyle, sidebar as sidebarMetrics, Spinner } from "./ui";
@@ -71,6 +78,10 @@ type ChatState = {
   error: string | null;
   liveId: string | null;
   visibleCount: number;
+  branchTree: BranchTreeNode[];
+  branchLeafId: string | null;
+  branchBusy: boolean;
+  branchError: string | null;
 };
 
 type MessageEdit = {
@@ -128,6 +139,10 @@ function createChatSession(id: string, projectPath: string | null, path: string 
       error: null,
       liveId: null,
       visibleCount: PAGE_SIZE,
+      branchTree: [],
+      branchLeafId: null,
+      branchBusy: false,
+      branchError: null,
     },
     client: null,
     clientReady: null,
@@ -319,6 +334,15 @@ function withSetValue(set: Set<string>, value: string, present: boolean): Set<st
   return next;
 }
 
+function nextForkTitle(title: string, taken: Set<string>): string {
+  const match = / \((\d+)\)$/.exec(title);
+  const base = title.replace(/ \(\d+\)$/, "").trim() || title;
+  for (let index = match ? Number(match[1]) + 1 : 2; ; index++) {
+    const candidate = `${base} (${index})`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
+
 function applyAssistantDelta(blocks: ContentBlock[], event: Record<string, unknown>): ContentBlock[] {
   const index = typeof event.contentIndex === "number" ? event.contentIndex : 0;
   const next = blocks.slice();
@@ -343,6 +367,58 @@ function applyAssistantDelta(blocks: ContentBlock[], event: Record<string, unkno
   return next;
 }
 
+function branchPathIds(nodes: BranchTreeNode[], targetId: string | null): Set<string> {
+  if (!targetId) return new Set();
+  const stack = nodes.map((node) => ({ node, path: [node.entry.id] }));
+  while (stack.length) {
+    const { node, path } = stack.pop()!;
+    if (node.entry.id === targetId || node.compressedEntryIds?.includes(targetId)) return new Set(path);
+    for (const child of node.children) stack.push({ node: child, path: [...path, child.entry.id] });
+  }
+  return new Set();
+}
+
+function topLevelBranchNodes(nodes: BranchTreeNode[]): BranchTreeNode[] {
+  if (nodes.length > 1) return nodes;
+  if (!nodes.length) return [];
+  let node = nodes[0];
+  while (node.children.length === 1) node = node.children[0];
+  return node.children.length > 1 ? node.children : [];
+}
+
+function isStructuralBranchNode(node: BranchTreeNode): boolean {
+  return !node.entry.role && !node.preview;
+}
+
+function visibleBranchRowCount(nodes: BranchTreeNode[]): number {
+  let count = 0;
+  const stack = [...nodes];
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (isStructuralBranchNode(node)) {
+      for (const child of node.children) stack.push(child);
+      continue;
+    }
+    count++;
+    for (const child of node.children) stack.push(child);
+  }
+  return count;
+}
+
+function sessionTreeEntryById(nodes: SessionTreeNode[], id: string): SessionTreeNode | null {
+  const stack = [...nodes];
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (node.entry.id === id) return node;
+    for (const child of node.children) stack.push(child);
+  }
+  return null;
+}
+
+function isUserTreeEntry(entry: SessionTreeNode["entry"]): boolean {
+  return entry.type === "custom_message" || (entry.type === "message" && (entry.role === "user" || entry.message?.role === "user"));
+}
+
 function App() {
   const projects = signal<ProjectInfo[]>([]);
   const sessions = signal<Record<string, SessionInfo[]>>({});
@@ -363,6 +439,8 @@ function App() {
   const thinkingLevels = signal<ThinkingLevel[]>([]);
   const thinkingChosen = signal(false);
   const thinkingOpen = signal(false);
+  const branchOpen = signal(false);
+  const forkingTurnId = signal<string | null>(null);
   const messageEdit = signal<MessageEdit | null>(null);
   const editHeight = signal(48);
   const copiedMessageId = signal<string | null>(null);
@@ -413,6 +491,11 @@ function App() {
   const error = computed(() => chatView().error ?? appError());
   const liveId = computed(() => chatView().liveId);
   const chatOpen = computed(() => Boolean(activeSession()) || chatView().messages.length > 0);
+  const branchTree = computed(() => chatView().branchTree);
+  const branchLeafId = computed(() => chatView().branchLeafId);
+  const branchBusy = computed(() => chatView().branchBusy);
+  const branchError = computed(() => chatView().branchError);
+  const sessionHasBranches = computed(() => hasSessionBranches(branchTree()));
 
   const currentModel = computed(() => {
     const key = modelKey();
@@ -481,7 +564,6 @@ function App() {
     if (!project || !session) return null;
     return (sessions()[project] ?? []).find((item) => item.path === session) ?? null;
   });
-
   const persistProjects = async (list = projects()) => {
     try {
       await Storage.setItem(PROJECTS_KEY, JSON.stringify(list));
@@ -545,6 +627,61 @@ function App() {
     const model = state?.model ?? models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
     const levels = await readThinkingLevels(client, model);
     applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
+  };
+
+  const refreshBranchTree = async (client: PiClient, chat: ChatSession) => {
+    const data = await client.request<{ tree?: SessionTreeNode[]; leafId?: string | null }>("get_tree");
+    const rawTree = Array.isArray(data?.tree) ? data.tree : [];
+    const leafId = typeof data?.leafId === "string" ? data.leafId : null;
+    setChatState(chat, { branchTree: projectBranchTree(rawTree), branchLeafId: leafId, branchError: null });
+  };
+
+  const refreshBranchTreeLater = (chat: ChatSession) => {
+    if (chat.client) void refreshBranchTree(chat.client, chat).catch(() => {});
+  };
+
+  const readChatContext = async (client: PiClient) => {
+    const [state, data, treeData] = await Promise.all([
+      client.request<{ model?: ModelInfo; thinkingLevel?: string }>("get_state"),
+      client.request<{ messages?: PiMessage[] }>("get_messages"),
+      client.request<{ tree?: SessionTreeNode[]; leafId?: string | null }>("get_tree"),
+    ]);
+    const history = (data?.messages ?? []).map((message, index) => ({ ...message, id: `history-${index}-${message.timestamp ?? 0}` }));
+    return {
+      state,
+      history,
+      tree: projectBranchTree(Array.isArray(treeData?.tree) ? treeData.tree : []),
+      leafId: typeof treeData?.leafId === "string" ? treeData.leafId : null,
+    };
+  };
+
+  const applyContextSettings = async (
+    client: PiClient,
+    chat: ChatSession,
+    state: { model?: ModelInfo; thinkingLevel?: string } | undefined,
+  ) => {
+    applyModel(state?.model, chat);
+    const model = state?.model ?? models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+    const levels = await readThinkingLevels(client, model);
+    applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
+  };
+
+  const loadChatContext = async (client: PiClient, chat: ChatSession) => {
+    const { state, history, tree, leafId } = await readChatContext(client);
+    await applyContextSettings(client, chat, state);
+    setChatState(chat, {
+      messages: history,
+      collapsed: collapsedTurnsOf(history),
+      toolRuns: {},
+      expandedBlocks: new Set(),
+      branchTree: tree,
+      branchLeafId: leafId,
+      branchBusy: false,
+      branchError: null,
+    });
+    chat.loaded = true;
+    chat.loadedAt = Date.now();
+    return history;
   };
 
   const collapseAllWork = (chat = activeChat()) => {
@@ -612,6 +749,10 @@ function App() {
         error: null,
         status: null,
         liveId: null,
+        branchTree: [],
+        branchLeafId: null,
+        branchBusy: false,
+        branchError: null,
       });
       excess--;
     }
@@ -621,22 +762,18 @@ function App() {
     if (!chat.projectPath) return;
     try {
       const started = chat.client ?? (await ensureClient(chat));
-      const [state, data] = await Promise.all([
-        started.request<{ model?: ModelInfo; thinkingLevel?: string }>("get_state"),
-        started.request<{ messages?: PiMessage[] }>("get_messages"),
-      ]);
+      const { state, history, tree, leafId } = await readChatContext(started);
       if (token !== undefined && token !== chat.loadToken) return;
-      applyModel(state?.model, chat);
-      const model = state?.model ?? models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
-      const levels = await readThinkingLevels(started, model);
-      applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
-      const history = (data?.messages ?? []).map((message, index) => ({ ...message, id: `history-${index}-${message.timestamp ?? 0}` }));
+      await applyContextSettings(started, chat, state);
       setChatState(chat, {
         messages: history,
         collapsed: collapsedTurnsOf(history),
         toolRuns: {},
         expandedBlocks: new Set(),
         loading: false,
+        branchTree: tree,
+        branchLeafId: leafId,
+        branchError: null,
       });
       chat.loaded = true;
       chat.loadedAt = Date.now();
@@ -660,6 +797,9 @@ function App() {
         collapsed: collapsedTurnsOf(history.messages),
         expandedBlocks: new Set(),
         loading: false,
+        branchTree: projectBranchTree(history.tree),
+        branchLeafId: history.leafId,
+        branchError: null,
         ...(firstLoad ? { visibleCount: PAGE_SIZE } : {}),
       });
       chat.loaded = true;
@@ -730,6 +870,7 @@ function App() {
           chat.openMessageId = id;
           updateMessages((list) => list.map((message) => (message.id === id ? { ...raw, id } : message)));
           chat.pendingUserId = null;
+          refreshBranchTreeLater(chat);
         } else {
           const id = newMessageId(raw.role === "assistant" ? "assistant" : raw.role);
           chat.openMessageId = id;
@@ -783,6 +924,7 @@ function App() {
                 chat.liveAssistantId = null;
                 set({ running: false, liveId: null, status: null });
                 collapseAllWork(chat);
+                refreshBranchTreeLater(chat);
                 bumpSession(chat);
                 trimChatStates();
               }
@@ -850,6 +992,7 @@ function App() {
         chat.liveAssistantId = null;
         set({ running: false, liveId: null, status: null });
         collapseAllWork(chat);
+        refreshBranchTreeLater(chat);
         bumpSession(chat);
         trimChatStates();
         if (chat.path) {
@@ -994,6 +1137,7 @@ function App() {
     chat.lastUsed = Date.now();
     messageEdit.set(null);
     editHeight.set(48);
+    branchOpen.set(false);
     modelKey.set(chat.modelKey);
     modelChosen.set(chat.modelChosen);
     const model = models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
@@ -1093,6 +1237,7 @@ function App() {
     activeSession.set(null);
     modelOpen.set(false);
     thinkingOpen.set(false);
+    branchOpen.set(false);
     evictClients();
   };
 
@@ -1104,6 +1249,7 @@ function App() {
     if (chat.state.running) return;
     modelOpen.set(false);
     thinkingOpen.set(false);
+    branchOpen.set(false);
     const projectPath = chat.projectPath ?? activeProject();
     if (!projectPath) {
       addOpen.set(true);
@@ -1206,6 +1352,22 @@ function App() {
     editHeight.set(48);
   };
 
+  const runBranchCommand = (client: PiClient, command: string, entryId: string) =>
+    client.request<{ disposition?: string }>("prompt", { message: `/${command} ${entryId}` });
+
+  const navigateTreeTarget = async (client: PiClient, targetId: string) => {
+    const before = await client.request<{ tree?: SessionTreeNode[]; leafId?: string | null }>("get_tree");
+    const rawTree = Array.isArray(before?.tree) ? before.tree : [];
+    const target = sessionTreeEntryById(rawTree, targetId);
+    if (!target) throw new Error("That branch is no longer in the session.");
+    const expectedLeaf = isUserTreeEntry(target.entry) ? target.entry.parentId : targetId;
+    await runBranchCommand(client, BRANCH_NAVIGATE_COMMAND, targetId);
+    const after = await client.request<{ tree?: SessionTreeNode[]; leafId?: string | null }>("get_tree");
+    const leafId = typeof after?.leafId === "string" ? after.leafId : null;
+    if (leafId !== expectedLeaf) throw new Error("pi could not switch to that branch.");
+    return typeof before?.leafId === "string" ? before.leafId : null;
+  };
+
   const resolveUserEntryId = async (client: PiClient, chat: ChatSession, message: PiMessage): Promise<string | null> => {
     if (message.entryId) return message.entryId;
     const data = await client.request<{ messages?: Array<{ entryId?: string; text?: string }> }>("get_fork_messages");
@@ -1243,44 +1405,30 @@ function App() {
     }
 
     messageEdit.set({ ...edit, saving: true });
-    let forked = false;
-    let forkedMessages: PiMessage[] | null = null;
+    setChatState(chat, { branchBusy: true, branchError: null });
+    let client: PiClient | null = null;
+    let navigated = false;
+    let previousLeafId: string | null = null;
+    let optimisticId: string | null = null;
     try {
-      const client = chat.client ?? (await ensureClient(chat));
+      client = chat.client ?? (await ensureClient(chat));
       const entryId = await resolveUserEntryId(client, chat, message);
       if (!entryId) throw new Error("Could not find that message in the pi session.");
-      const result = await client.request<{ text?: string; cancelled?: boolean }>("fork", { entryId });
-      if (result?.cancelled) throw new Error("Editing was cancelled.");
-      forked = true;
-
-      const state = await client.request<{ sessionFile?: string }>("get_state");
-      const nextSessionFile = state?.sessionFile ?? null;
-      if (nextSessionFile) {
-        try {
-          const loaded = await loadSessionHistory(nextSessionFile);
-          forkedMessages = loaded.messages;
-          chat.mtimeMs = loaded.mtimeMs;
-          chat.size = loaded.size;
-          chat.loadedAt = Date.now();
-        } catch {
-          const data = await client.request<{ messages?: PiMessage[] }>("get_messages");
-          forkedMessages = (data?.messages ?? []).map((item, index) => ({ ...item, id: `history-${index}-${item.timestamp ?? 0}` }));
-        }
-      } else {
-        const data = await client.request<{ messages?: PiMessage[] }>("get_messages");
-        forkedMessages = (data?.messages ?? []).map((item, index) => ({ ...item, id: `history-${index}-${item.timestamp ?? 0}` }));
-      }
+      previousLeafId = await navigateTreeTarget(client, entryId);
+      navigated = true;
+      const branchMessages = await loadChatContext(client, chat);
 
       const localId = newMessageId("local");
+      optimisticId = localId;
       const optimistic: PiMessage = { id: localId, role: "user", content: text, timestamp: Date.now() };
       chat.pendingUserId = localId;
       chat.liveAssistantId = null;
       chat.openMessageId = null;
       chat.loaded = true;
       setChatState(chat, {
-        messages: [...forkedMessages, optimistic],
+        messages: [...branchMessages, optimistic],
         toolRuns: {},
-        collapsed: collapsedTurnsOf(forkedMessages),
+        collapsed: collapsedTurnsOf(branchMessages),
         expandedBlocks: new Set(),
         visibleCount: PAGE_SIZE,
         running: true,
@@ -1289,20 +1437,33 @@ function App() {
         error: null,
         status: null,
       });
-      if (nextSessionFile) adoptSessionPath(chat, nextSessionFile);
       messageEdit.set(null);
       editHeight.set(48);
       await client.request("prompt", { message: text });
     } catch (reason) {
       chat.pendingUserId = null;
       const detail = errorText(reason);
-      if (forked) {
+      let restored = false;
+      if (navigated && client && previousLeafId) {
+        try {
+          await navigateTreeTarget(client, previousLeafId);
+          await loadChatContext(client, chat);
+          restored = true;
+        } catch {
+          // Keep the branch pi already selected if it cannot be restored.
+        }
+      }
+      if (restored) {
+        messageEdit.set({ ...edit, saving: false });
+        setChatState(chat, { running: false, loading: false, branchBusy: false, error: detail });
+      } else if (navigated) {
         messageEdit.set(null);
         editHeight.set(48);
         setChatState(chat, {
-          messages: forkedMessages ?? chat.state.messages,
+          messages: optimisticId ? chat.state.messages.filter((message) => message.id !== optimisticId) : chat.state.messages,
           running: false,
           loading: false,
+          branchBusy: false,
           error: detail,
         });
         if (chat === activeChat()) {
@@ -1311,8 +1472,103 @@ function App() {
         }
       } else {
         messageEdit.set({ ...edit, saving: false });
-        setChatState(chat, { running: false, loading: false, error: detail });
+        setChatState(chat, { running: false, loading: false, branchBusy: false, error: detail });
       }
+    }
+  };
+
+  const chooseBranch = async (leafId: string) => {
+    const chat = activeChat();
+    if (chat === blankChat || !chat.path || chat.state.running || chat.state.loading || chat.state.branchBusy) return;
+    if (leafId === chat.state.branchLeafId) {
+      branchOpen.set(false);
+      return;
+    }
+    setChatState(chat, { branchBusy: true, branchError: null });
+    try {
+      const client = chat.client ?? (await ensureClient(chat));
+      await navigateTreeTarget(client, leafId);
+      await loadChatContext(client, chat);
+      branchOpen.set(false);
+    } catch (reason) {
+      setChatState(chat, { branchBusy: false, branchError: errorText(reason) });
+    }
+  };
+
+  const resolveAssistantEntryId = async (client: PiClient, message: PiMessage): Promise<string | null> => {
+    if (message.entryId) return message.entryId;
+    const data = await client.request<{ entries?: SessionTreeEntry[] }>("get_entries");
+    const candidates = (data?.entries ?? []).filter((entry) => {
+      if (entry.type !== "message" || entry.message?.role !== "assistant") return false;
+      return entry.message.content != null;
+    });
+    const targetText = assistantText(message).trim();
+    const targetTime = message.timestamp;
+    for (let index = candidates.length - 1; index >= 0; index--) {
+      const candidate = candidates[index];
+      if (targetTime !== undefined && candidate.message?.timestamp !== targetTime) continue;
+      if (assistantText(candidate.message!).trim() === targetText) return candidate.id;
+    }
+    for (let index = candidates.length - 1; index >= 0; index--) {
+      if (assistantText(candidates[index].message!).trim() === targetText) return candidates[index].id;
+    }
+    return null;
+  };
+
+  const forkTurn = async (chat: ChatSession, turnMessages: PiMessage[], turnId: string) => {
+    if (chat === blankChat || !chat.path || chat.state.running || chat.state.loading || forkingTurnId()) return;
+    const assistant = [...turnMessages].reverse().find((message) => message.role === "assistant");
+    if (!assistant) return;
+    forkingTurnId.set(turnId);
+    setChatState(chat, { error: null });
+    try {
+      const client = chat.client ?? (await ensureClient(chat));
+      const entryId = await resolveAssistantEntryId(client, assistant);
+      if (!entryId) throw new Error("Could not find that response in the pi session.");
+      const previousSessionFile = chat.path;
+      await runBranchCommand(client, BRANCH_FORK_AT_COMMAND, entryId);
+      const nextState = await client.request<{ sessionFile?: string }>("get_state");
+      const nextSessionFile = nextState?.sessionFile ?? null;
+      if (!nextSessionFile || nextSessionFile === previousSessionFile) throw new Error("Fork was cancelled.");
+
+      const projectPath = chat.projectPath;
+      const projectSessions = projectPath ? sessions()[projectPath] ?? [] : [];
+      const currentTitle =
+        projectSessions.find((session) => session.path === previousSessionFile)?.title ??
+        cleanSessionTitle(textOfContent(chat.state.messages.find((message) => message.role === "user")?.content) || "New chat");
+      const forkTitle = nextForkTitle(currentTitle, new Set(projectSessions.map((session) => session.title)));
+      await client.request("set_session_name", { name: forkTitle }).catch(() => {});
+
+      adoptSessionPath(chat, nextSessionFile);
+      if (projectPath) {
+        const now = Date.now();
+        sessions.update((current) => ({
+          ...current,
+          [projectPath]: [
+            { path: nextSessionFile, title: forkTitle, modified: now, mtimeMs: now },
+            ...(current[projectPath] ?? []).filter((session) => session.path !== nextSessionFile),
+          ],
+        }));
+      }
+      chat.pendingUserId = null;
+      chat.liveAssistantId = null;
+      chat.openMessageId = null;
+      await loadChatContext(client, chat);
+      setChatState(chat, {
+        visibleCount: PAGE_SIZE,
+        running: false,
+        loading: false,
+        liveId: null,
+        error: null,
+        status: null,
+        branchError: null,
+      });
+      messageEdit.set(null);
+      editHeight.set(48);
+    } catch (reason) {
+      setChatState(chat, { error: errorText(reason) });
+    } finally {
+      forkingTurnId.set(null);
     }
   };
 
@@ -1484,6 +1740,7 @@ function App() {
       draftChatId.set(null);
       modelOpen.set(false);
       thinkingOpen.set(false);
+      branchOpen.set(false);
       messageEdit.set(null);
       draft.set("");
       inputHeight.set(22);
@@ -2219,6 +2476,9 @@ function App() {
     const hasDetails = computed(() => turnMessages().some((message) => hasWork(message)));
     const live = computed(() => turnMessages().some((message) => message.id === liveId()));
     const showCopy = computed(() => Boolean(text().trim()) && (hovering() || lastTurnId() === item().id));
+    const forking = computed(() => forkingTurnId() === item().id);
+    const showFork = computed(() => forking() || (!running() && (hovering() || lastTurnId() === item().id)));
+    const canFork = computed(() => turnMessages().some((message) => message.role === "assistant") && !running() && !loading());
     const error = computed(() => {
       for (let index = turnMessages().length - 1; index >= 0; index--) {
         const message = turnMessages()[index];
@@ -2249,7 +2509,7 @@ function App() {
         <If when={Boolean(error())}>
           <Text style={{ fontSize: 12, lineHeight: 18, color: colors.danger }}>{error()}</Text>
         </If>
-        <View style={{ alignSelf: "flex-start", width: 22, height: 22 }}>
+        <View style={{ alignSelf: "flex-start", width: 46, height: 22, flexDirection: "row", alignItems: "center", gap: 2 }}>
           <If when={showCopy()}>
             <Press
               onPress={() => void copyText(item().id, text())}
@@ -2260,6 +2520,21 @@ function App() {
               tooltip={<Text style={{ fontSize: 12 }}>Copy</Text>}
             >
               <Icon name={copiedMessageId() === item().id ? "check" : "copy"} size={13} tint={colors.mutedText} />
+            </Press>
+          </If>
+          <If when={showFork()}>
+            <Press
+              onPress={() => void forkTurn(activeChat(), turnMessages(), item().id)}
+              disabled={!canFork() || Boolean(forkingTurnId())}
+              hoverStyle={{ backgroundColor: colors.accent }}
+              activeStyle={{ opacity: 0.7 }}
+              style={{ width: 22, height: 22, borderRadius: 5, alignItems: "center", justifyContent: "center" }}
+              accessibilityLabel="Fork response into a new chat"
+              tooltip={<Text style={{ fontSize: 12 }}>Fork into new chat</Text>}
+            >
+              <If when={forking()} else={<Icon name="branch" size={13} tint={colors.mutedText} />}>
+                <Spinner size={11} />
+              </If>
             </Press>
           </If>
         </View>
@@ -2277,6 +2552,204 @@ function App() {
     return <MessageRow message={() => (item().kind === "note" ? (item() as NoteDisplay).message : undefined)} />;
   }
 
+  function BranchTreeNodeView(props: {
+    node: BranchTreeNode;
+    activePath: Set<string>;
+    leafId: string | null;
+    parentLines: boolean[];
+    isLast: boolean;
+    locked: boolean;
+  }) {
+    const node = props.node;
+    const onPath = props.activePath.has(node.entry.id) || props.activePath.size === 0;
+    const role = node.entry.role;
+    const skipped = node.compressedEntryIds?.length ?? 0;
+    const label = node.preview || node.entry.type.replace(/_/g, " ");
+    const selected = node.entry.id === props.leafId || Boolean(props.leafId && node.compressedEntryIds?.includes(props.leafId));
+
+    if (isStructuralBranchNode(node)) {
+      return (
+        <Each of={node.children}>
+          {(child) => (
+            <BranchTreeNodeView
+              node={child()}
+              activePath={props.activePath}
+              leafId={props.leafId}
+              parentLines={[...props.parentLines, !props.isLast]}
+              isLast={child() === node.children[node.children.length - 1]}
+              locked={props.locked}
+            />
+          )}
+        </Each>
+      );
+    }
+
+    return (
+      <View>
+        <Press
+          onPress={() => void chooseBranch(node.entry.id)}
+          disabled={props.locked}
+          hoverStyle={{ backgroundColor: colors.accent }}
+          activeStyle={{ opacity: 0.7 }}
+          accessibilityLabel={`Switch to branch ${label}`}
+          accessibilityState={{ selected }}
+          style={{ minHeight: 26, paddingRight: 8, borderRadius: 6, flexDirection: "row", alignItems: "center" }}
+        >
+          <Each of={props.parentLines}>
+            {(line) => (
+              <View style={{ width: 13, alignSelf: "stretch", marginLeft: 5, borderLeftWidth: line() ? 1 : 0, borderColor: colors.line }} />
+            )}
+          </Each>
+          <View style={{ width: 14, alignSelf: "stretch", position: "relative" }}>
+            <View
+              style={{
+                position: "absolute",
+                left: 6,
+                top: 0,
+                bottom: props.isLast ? "50%" : 0,
+                width: 1,
+                backgroundColor: colors.line,
+              }}
+            />
+            <View style={{ position: "absolute", left: 6, top: "50%", width: 8, height: 1, backgroundColor: colors.line }} />
+          </View>
+          <View
+            style={{
+              width: 7,
+              height: 7,
+              borderRadius: 4,
+              marginRight: 6,
+              backgroundColor: selected ? colors.text : "transparent",
+              borderWidth: selected ? 0 : 1,
+              borderColor: onPath ? colors.mutedText : colors.faint,
+            }}
+          />
+          <If when={Boolean(role)}>
+            <View style={{ minWidth: 16, height: 16, paddingHorizontal: 3, marginRight: 5, borderRadius: 3, backgroundColor: colors.muted, alignItems: "center", justifyContent: "center" }}>
+              <Text style={{ fontSize: 9, fontWeight: "600", color: role === "user" ? colors.text : colors.mutedText }}>
+                {role === "user" ? "U" : "A"}
+              </Text>
+            </View>
+          </If>
+          <If when={skipped > 0}>
+            <Text style={{ marginRight: 5, fontSize: 10, color: colors.faint }}>{`+${skipped}`}</Text>
+          </If>
+          <Text
+            style={{
+              flex: 1,
+              minWidth: 0,
+              numberOfLines: 1,
+              textOverflow: "ellipsis",
+              paddingRight: 6,
+              fontSize: 11.5,
+              fontWeight: onPath ? "500" : "400",
+              color: onPath ? colors.text : colors.faint,
+            }}
+          >
+            {label}
+          </Text>
+          <If when={selected}>
+            <Icon name="check" size={11} tint={colors.text} />
+          </If>
+        </Press>
+        <Each of={node.children}>
+          {(child) => (
+            <BranchTreeNodeView
+              node={child()}
+              activePath={props.activePath}
+              leafId={props.leafId}
+              parentLines={[...props.parentLines, !props.isLast]}
+              isLast={child() === node.children[node.children.length - 1]}
+              locked={props.locked}
+            />
+          )}
+        </Each>
+      </View>
+    );
+  }
+
+  function BranchPicker() {
+    const topLevel = computed(() => topLevelBranchNodes(branchTree()));
+    const activePath = computed(() => branchPathIds(branchTree(), branchLeafId()));
+    const locked = computed(() => running() || loading() || branchBusy());
+    const treeHeight = computed(() => {
+      const rows = visibleBranchRowCount(topLevel());
+      const notices = (branchError() ? 21 : 0) + (locked() && sessionHasBranches() ? 18 : 0);
+      return rows ? Math.min(360, 32 + rows * 26 + notices) : 80;
+    });
+    return (
+      <Popover
+        open={branchOpen()}
+        onOpenChange={({ open }) => {
+          branchOpen.set(open);
+          if (open) {
+            modelOpen.set(false);
+            thinkingOpen.set(false);
+          }
+        }}
+        placement="top"
+        align="start"
+        offset={6}
+        margin={10}
+        popupClass="rounded-xl border border-border bg-popover shadow-lg"
+        trigger={
+          <View
+            role="button"
+            accessibilityLabel="Session branches"
+            accessibilityState={{ expanded: branchOpen() }}
+            style={{ width: 112, height: 28, flexShrink: 0, borderRadius: 7, paddingHorizontal: 7, flexDirection: "row", alignItems: "center", gap: 5 }}
+            hoverStyle={{ backgroundColor: colors.accent }}
+          >
+            <Icon name="branch" size={12} tint={sessionHasBranches() ? colors.text : colors.faint} />
+            <Text style={{ numberOfLines: 1, textOverflow: "ellipsis", flexShrink: 1, fontSize: 11.5, color: colors.mutedText }}>
+              Branches
+            </Text>
+            <Icon name="chevron-down" size={12} tint={colors.faint} />
+          </View>
+        }
+      >
+        <View style={{ width: 340, height: treeHeight() }}>
+          <View style={{ flex: 1, minHeight: 0, paddingTop: 4, paddingHorizontal: 4 }}>
+            <View style={{ height: 24, paddingHorizontal: 2, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+              <Text style={{ fontSize: 10, fontWeight: "600", letterSpacing: 0.4, color: colors.faint }}>SESSION TREE</Text>
+              <If when={branchBusy()}>
+                <Spinner size={10} />
+              </If>
+            </View>
+            <If when={Boolean(branchError())}>
+              <Text style={{ paddingHorizontal: 2, paddingBottom: 5, fontSize: 11, lineHeight: 16, color: colors.danger }}>{branchError()}</Text>
+            </If>
+            <If when={locked() && sessionHasBranches()}>
+              <Text style={{ paddingHorizontal: 2, paddingBottom: 5, fontSize: 10.5, color: colors.faint }}>Finish the current turn to switch branches.</Text>
+            </If>
+            <If when={topLevel().length > 0} else={
+              <View style={{ paddingHorizontal: 2, paddingTop: 3, paddingBottom: 6 }}>
+                <Text style={{ paddingHorizontal: 6, fontSize: 11.5, lineHeight: 17, color: colors.mutedText }}>
+                  No branches yet. Edit a message or fork a response to create one.
+                </Text>
+              </View>
+            }>
+              <Scroll style={{ flex: 1, minHeight: 0 }} contentStyle={{ paddingBottom: 4 }} scrollbar>
+              <Each of={topLevel()}>
+                {(node) => (
+                  <BranchTreeNodeView
+                    node={node()}
+                    activePath={activePath()}
+                    leafId={branchLeafId()}
+                    parentLines={[]}
+                    isLast={node() === topLevel()[topLevel().length - 1]}
+                    locked={locked()}
+                  />
+                )}
+              </Each>
+              </Scroll>
+            </If>
+          </View>
+        </View>
+      </Popover>
+    );
+  }
+
   function ModelPicker() {
     const title = computed(() => {
       const model = currentModel();
@@ -2287,7 +2760,10 @@ function App() {
         open={modelOpen()}
         onOpenChange={({ open }) => {
           modelOpen.set(open);
-          if (open) thinkingOpen.set(false);
+          if (open) {
+            thinkingOpen.set(false);
+            branchOpen.set(false);
+          }
         }}
         placement="top"
         align="start"
@@ -2359,7 +2835,10 @@ function App() {
         open={thinkingOpen()}
         onOpenChange={({ open }) => {
           thinkingOpen.set(open);
-          if (open) modelOpen.set(false);
+          if (open) {
+            modelOpen.set(false);
+            branchOpen.set(false);
+          }
         }}
         placement="top"
         align="start"
@@ -2450,6 +2929,7 @@ function App() {
                 onFocus={() => {
                   modelOpen.set(false);
                   thinkingOpen.set(false);
+                  branchOpen.set(false);
                 }}
                 placeholder={placeholder()}
                 submitBehavior="submit"
@@ -2467,11 +2947,12 @@ function App() {
                 }}
                 accessibilityLabel="Message pi"
               />
-              <If when={modelOpen() || thinkingOpen()}>
+              <If when={modelOpen() || thinkingOpen() || branchOpen()}>
                 <View
                   onPress={() => {
                     modelOpen.set(false);
                     thinkingOpen.set(false);
+                    branchOpen.set(false);
                     composerInput?.focus();
                   }}
                   style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}
@@ -2481,6 +2962,7 @@ function App() {
             <View style={{ height: 30, flexDirection: "row", alignItems: "center", gap: 7, paddingLeft: 2 }}>
               <ModelPicker />
               <ThinkingPicker />
+              <BranchPicker />
               <View style={{ flex: 1 }} />
               <If
                 when={running()}
@@ -2557,7 +3039,7 @@ function App() {
   function Chat() {
     return (
       <View style={{ flex: 1, minHeight: 0 }}>
-        <Each of={[activeChat().id]}>
+        <Each of={[`${activeChat().id}:${branchLeafId() ?? "root"}`]}>
           {() => (
             <If
               when={loading() && messages().length === 0}
