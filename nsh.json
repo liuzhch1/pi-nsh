@@ -7,6 +7,11 @@
   "theme": "theme.json",
   "window": {
     "title": "Pi",
+    "titleBar": {
+      "style": "hidden",
+      "height": 48,
+      "controlsOffset": { "x": 20, "y": 17 }
+    },
     "defaultSize": { "width": 1180, "height": 820 },
     "minSize": { "width": 900, "height": 600 }
   },

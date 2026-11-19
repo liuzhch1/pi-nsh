@@ -17,7 +17,7 @@ import {
   type ViewRef,
 } from "nsh";
 import { ContextMenu, Input, MenuItem, MenuSeparator, Popover, TextView } from "nsh/base";
-import { Window } from "nsh/desktop";
+import { titleBar, Window } from "nsh/desktop";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
@@ -2022,11 +2022,20 @@ function App() {
           backgroundColor: colors.sidebar,
           borderRightWidth: 1,
           borderRightColor: colors.sidebarBorder,
-          paddingTop: 10,
           paddingBottom: 8,
         }}
       >
-        <View style={{ height: 38, flexDirection: "row", alignItems: "center", gap: 9, paddingHorizontal: 16 }}>
+        <View
+          desktop={{ windowDrag: true }}
+          style={{
+            height: titleBar().height || 48,
+            flexDirection: "row",
+            alignItems: "center",
+            gap: 9,
+            paddingLeft: titleBar().left + 16,
+            paddingRight: 16,
+          }}
+        >
           <Text style={{ fontSize: 14, fontWeight: "600", color: colors.text, letterSpacing: -0.1 }}>Pi</Text>
         </View>
 
@@ -2089,8 +2098,9 @@ function App() {
     const session = computed(() => activeSessionInfo());
     return (
       <View
+        desktop={{ windowDrag: true }}
         style={{
-          height: 48,
+          height: titleBar().height || 48,
           flexShrink: 0,
           borderBottomWidth: 1,
           borderBottomColor: colors.line,
@@ -2098,7 +2108,7 @@ function App() {
           flexDirection: "row",
           alignItems: "center",
           paddingLeft: 14,
-          paddingRight: 22,
+          paddingRight: titleBar().right + 22,
           gap: 10,
         }}
       >
