@@ -253,16 +253,40 @@ async function versionBinDirs(root: string, suffix: string): Promise<string[]> {
   }
 }
 
+function envDir(name: string): string | null {
+  const value = process.env[name];
+  return value && path.isAbsolute(value) ? value : null;
+}
+
+function windowsAppData(home: string): string {
+  return envDir("APPDATA") ?? path.join(home, "AppData", "Roaming");
+}
+
+function windowsLocalAppData(home: string): string {
+  return envDir("LOCALAPPDATA") ?? path.join(home, "AppData", "Local");
+}
+
+function expandConfigPath(value: string, home: string): string {
+  let expanded = value
+    .replace(/%([^%]+)%/g, (match, name: string) => process.env[name] ?? match)
+    .replace(/\$\{([^}]+)\}/g, (match, name: string) => process.env[name] ?? match);
+  if (expanded === "~") expanded = home;
+  else if (expanded.startsWith("~/") || expanded.startsWith("~\\")) expanded = path.join(home, expanded.slice(2));
+  return expanded;
+}
+
 async function npmPrefixDir(home: string): Promise<string | null> {
   const configured = process.env.NPM_CONFIG_PREFIX;
-  if (configured && path.isAbsolute(configured)) return configured;
+  if (configured) {
+    const expanded = expandConfigPath(configured, home);
+    if (path.isAbsolute(expanded)) return expanded;
+  }
   try {
     const text = await fs.readFile(path.join(home, ".npmrc"), "utf8");
     for (const line of text.split("\n")) {
       const [key, ...rest] = line.split("=");
       if (key?.trim() !== "prefix") continue;
-      let value = rest.join("=").trim().replace(/^['"]|['"]$/g, "");
-      if (value.startsWith("~/")) value = path.join(home, value.slice(2));
+      const value = expandConfigPath(rest.join("=").trim().replace(/^['"]|['"]$/g, ""), home);
       if (path.isAbsolute(value)) return value;
     }
   } catch {}
@@ -272,6 +296,12 @@ async function npmPrefixDir(home: string): Promise<string | null> {
 async function piCandidateDirs(): Promise<string[]> {
   const home = os.homedir();
   const bunRoot = process.env.BUN_INSTALL;
+  const appData = windowsAppData(home);
+  const localAppData = windowsLocalAppData(home);
+  const pnpmHome = envDir("PNPM_HOME");
+  const voltaHome = envDir("VOLTA_HOME");
+  const miseData = envDir("MISE_DATA_DIR") ?? path.join(envDir("XDG_DATA_HOME") ?? localAppData, "mise");
+  const windows = process.platform === "windows";
   const dirs = [
     ...(process.env.PATH ?? "").split(path.delimiter),
     path.join(home, "bin"),
@@ -284,6 +314,12 @@ async function piCandidateDirs(): Promise<string[]> {
     path.join(home, ".local", "share", "mise", "shims"),
     path.join(home, ".local", "share", "pnpm"),
     path.join(home, "Library", "pnpm"),
+    windows ? path.join(appData, "npm") : "",
+    windows ? path.join(localAppData, "Volta", "bin") : "",
+    windows ? (voltaHome ? path.join(voltaHome, "bin") : "") : "",
+    windows ? (pnpmHome ?? path.join(localAppData, "pnpm")) : "",
+    windows ? path.join(miseData, "shims") : "",
+    windows ? (envDir("NVM_SYMLINK") ?? "") : "",
     path.join(home, ".cargo", "bin"),
     path.join(home, ".deno", "bin"),
     "/opt/homebrew/bin",
@@ -299,24 +335,32 @@ async function piCandidateDirs(): Promise<string[]> {
   ];
 
   const prefix = await npmPrefixDir(home);
-  if (prefix) dirs.push(path.join(prefix, "bin"));
+  if (prefix) dirs.push(windows ? prefix : path.join(prefix, "bin"));
 
   const fnmRoots = uniqueDirs([
     process.env.FNM_DIR ?? "",
     path.join(home, ".local", "share", "fnm"),
     path.join(home, "Library", "Application Support", "fnm"),
+    windows ? path.join(appData, "fnm") : "",
+    windows ? path.join(home, ".fnm") : "",
   ]);
   for (const root of fnmRoots) {
-    dirs.push(path.join(root, "aliases", "default", "bin"));
-    dirs.push(...(await versionBinDirs(path.join(root, "node-versions"), path.join("installation", "bin"))));
+    dirs.push(path.join(root, "aliases", "default", ...(windows ? [] : ["bin"])));
+    dirs.push(...(await versionBinDirs(path.join(root, "node-versions"), path.join("installation", ...(windows ? [] : ["bin"])))));
   }
 
-  const nvmRoots = uniqueDirs([process.env.NVM_DIR ?? "", path.join(home, ".nvm")]);
+  const nvmRoots = uniqueDirs([
+    process.env.NVM_DIR ?? "",
+    path.join(home, ".nvm"),
+    windows ? (envDir("NVM_HOME") ?? "") : "",
+    windows ? path.join(appData, "nvm") : "",
+  ]);
   for (const root of nvmRoots) {
-    dirs.push(...(await versionBinDirs(path.join(root, "versions", "node"), "bin")));
+    dirs.push(...(await versionBinDirs(windows ? root : path.join(root, "versions", "node"), windows ? "" : "bin")));
   }
 
   dirs.push(...(await versionBinDirs(path.join(home, ".local", "share", "mise", "installs", "node"), "bin")));
+  if (windows) dirs.push(...(await versionBinDirs(path.join(miseData, "installs", "node"), "")));
   return uniqueDirs(dirs);
 }
 
@@ -877,7 +921,9 @@ export class PiClient {
     const resolution = await resolvedPi();
     this.launchPath = resolution.executable;
     const child =
-      process.platform === "windows"
+      process.platform === "windows" && /\.(cmd|bat)$/i.test(resolution.executable)
+        ? process.spawn("cmd.exe", ["/d", "/c", resolution.executable, ...args], spawnOptions)
+        : process.platform === "windows"
         ? process.spawn(resolution.executable, args, spawnOptions)
         : process.spawn("env", [`PATH=${resolution.pathValue}`, resolution.executable, ...args], spawnOptions);
     if (this.expectedExit) {
