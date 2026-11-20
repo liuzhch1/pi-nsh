@@ -34,7 +34,7 @@ export const colors = colorsFrom({
 
 export const sidebar = {
   width: 278,
-  projectRow: 34,
+  entryRow: 30,
 };
 
 export const content = {

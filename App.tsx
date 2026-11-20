@@ -1920,6 +1920,10 @@ function App() {
   });
 
   effect(() => {
+    if (draftChatId()) composerInput?.focus();
+  });
+
+  effect(() => {
     const picker = openPicker();
     if (picker === "model" || picker === "thinking") void loadModels();
   });
@@ -1964,9 +1968,8 @@ function App() {
         onMouseEnter={() => hovering.set(true)}
         onMouseLeave={() => hovering.set(false)}
         style={{
-          height: 28,
-          marginLeft: 4,
-          borderRadius: 7,
+          height: sidebarMetrics.entryRow,
+          borderRadius: 8,
           flexDirection: "row",
           alignItems: "center",
           backgroundColor: selected() || hovering() ? colors.sidebarAccent : "transparent",
@@ -1975,7 +1978,7 @@ function App() {
         <Press
           onPress={() => void openExistingSession(projectPath(), session().path)}
           hoverStyle={{ backgroundColor: "transparent" }}
-          style={{ flex: 1, minWidth: 0, height: 28, paddingLeft: 27, paddingRight: 3, justifyContent: "center" }}
+          style={{ flex: 1, minWidth: 0, height: sidebarMetrics.entryRow, paddingLeft: 27, paddingRight: 3, justifyContent: "center" }}
           accessibilityLabel={session().title}
           accessibilityState={{ selected: selected() }}
         >
@@ -2001,7 +2004,7 @@ function App() {
         <View
           style={{
             width: 26,
-            height: 28,
+            height: sidebarMetrics.entryRow,
             alignItems: "center",
             justifyContent: "center",
             opacity: hovering() ? 1 : 0,
@@ -2047,7 +2050,7 @@ function App() {
               onMouseEnter={() => hovering.set(true)}
               onMouseLeave={() => hovering.set(false)}
               style={{
-                height: sidebarMetrics.projectRow,
+                height: sidebarMetrics.entryRow,
                 borderRadius: 8,
                 flexDirection: "row",
                 alignItems: "center",
