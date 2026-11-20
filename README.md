@@ -56,7 +56,7 @@ Projects are stored by the nsh app under its own app storage. Removing a project
 - `ui.tsx` — theme tokens and shared primitives
 - `theme.json` — grayscale light/dark palette
 
-The app asks for read/write access under the home folder because pi runs with the selected project as its working directory. Process execution is limited to `pi`, `env` (to launch a resolved pi with its tool paths), and `osascript` (the folder chooser).
+The app asks for read/write access under the home folder because pi runs with the selected project as its working directory. Process execution is limited to `pi`, `env` (to launch a resolved pi with its tool paths), `osascript` and `powershell.exe` (the folder chooser on macOS and Windows), and `cmd.exe` (to launch Windows executables and scripts).
 
 ## macOS permissions
 

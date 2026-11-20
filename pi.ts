@@ -315,6 +315,7 @@ async function piCandidateDirs(): Promise<string[]> {
     path.join(home, ".local", "share", "pnpm"),
     path.join(home, "Library", "pnpm"),
     windows ? path.join(appData, "npm") : "",
+    windows ? path.join(localAppData, "pi") : "",
     windows ? path.join(localAppData, "Volta", "bin") : "",
     windows ? (voltaHome ? path.join(voltaHome, "bin") : "") : "",
     windows ? (pnpmHome ?? path.join(localAppData, "pnpm")) : "",
@@ -382,7 +383,7 @@ async function resolvePi(): Promise<PiResolution> {
       if (await isExecutableFile(candidate)) return { executable: candidate, pathValue: dirs.join(path.delimiter) };
     }
   }
-  throw new Error("pi was not found. Install pi or make its executable folder available to the app.");
+  throw new Error("pi was not found.");
 }
 
 function resolvedPi(): Promise<PiResolution> {
@@ -921,10 +922,8 @@ export class PiClient {
     const resolution = await resolvedPi();
     this.launchPath = resolution.executable;
     const child =
-      process.platform === "windows" && /\.(cmd|bat)$/i.test(resolution.executable)
+      process.platform === "windows"
         ? process.spawn("cmd.exe", ["/d", "/c", resolution.executable, ...args], spawnOptions)
-        : process.platform === "windows"
-        ? process.spawn(resolution.executable, args, spawnOptions)
         : process.spawn("env", [`PATH=${resolution.pathValue}`, resolution.executable, ...args], spawnOptions);
     if (this.expectedExit) {
       child.kill();

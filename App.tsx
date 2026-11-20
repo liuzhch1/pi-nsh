@@ -54,6 +54,7 @@ import {
   type ThinkingLevel,
 } from "./pi";
 import { colors, content as contentMetrics, Press, roundButtonStyle, sidebar as sidebarMetrics, Spinner } from "./ui";
+import { chooseWindowsFolder } from "./windowsFolderPicker";
 
 const PROJECTS_KEY = "pi-nsh.projects.v2";
 const SESSIONS_KEY = "pi-nsh.sessions.v1";
@@ -323,8 +324,11 @@ function formatDuration(ms: number | undefined): string {
 }
 
 function errorText(reason: unknown): string {
-  const value = reason as { message?: string; code?: string; stderr?: string };
-  if (value?.code === "ERR_ACCESS_DENIED") return "Pi needs permission for that folder. Projects must be inside your home folder.";
+  const value = reason as { message?: string; code?: string; stderr?: string; permission?: string; resource?: string };
+  if (value?.code === "ERR_ACCESS_DENIED") {
+    if (value.permission === "process") return `The app is not allowed to run ${value.resource || "pi"}.`;
+    return "Pi needs permission for that folder. Projects must be inside your home folder.";
+  }
   return value?.message || value?.stderr || String(reason);
 }
 
@@ -1645,13 +1649,18 @@ function App() {
   };
 
   const chooseFolder = async () => {
-    if (process.platform !== "macos") {
-      addError.set("Choose folder is available on macOS. Paste the path instead.");
+    if (process.platform !== "macos" && process.platform !== "windows") {
+      addError.set("Choosing a folder is unavailable on this platform. Paste the path instead.");
       return;
     }
     picking.set(true);
     addError.set(null);
     try {
+      if (process.platform === "windows") {
+        const picked = await chooseWindowsFolder();
+        if (picked) addPath.set(picked);
+        return;
+      }
       const result = await process.run(
         "osascript",
         ["-e", 'POSIX path of (choose folder with prompt "Choose a project folder for pi")'],
@@ -1661,7 +1670,7 @@ function App() {
         if (!result.stderr.includes("-128")) addError.set(oneLine(result.stderr) || "The folder chooser did not open.");
         return;
       }
-      const picked = result.stdout.trim().replace(/\/+$/, "");
+      const picked = result.stdout.trim().replace(/[\\/]+$/, "");
       if (picked) addPath.set(picked);
     } catch (reason) {
       addError.set(errorText(reason));

@@ -16,13 +16,14 @@
     "minSize": { "width": 900, "height": 600 }
   },
   "capabilities": {
+    "application": true,
     "homeDir": true,
     "fs": {
       "read": ["${homeDir}"],
       "write": ["${homeDir}"]
     },
     "process": {
-      "execute": ["pi", "env", "osascript", "cmd.exe"],
+      "execute": ["pi", "env", "osascript", "cmd.exe", "powershell.exe"],
       "env": [
         "APPDATA",
         "LOCALAPPDATA",
