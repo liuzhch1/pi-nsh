@@ -12,6 +12,7 @@ export type IconName =
   | "compose"
   | "copy"
   | "branch"
+  | "archive"
   | "panel-left";
 
 export function Icon(props: { name: IconName; size?: number; tint: string }) {
@@ -73,6 +74,9 @@ export function Icon(props: { name: IconName; size?: number; tint: string }) {
             cx.beginPath();
             cx.arc(6, 18, 3, 0, Math.PI * 2);
             cx.stroke();
+            break;
+          case "archive":
+            cx.stroke(new Path2D("M4 5.5h16v4H4zM5.5 9.5v8a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-8M9.5 13h5"));
             break;
           case "panel-left":
             cx.stroke(new Path2D("M4 4.5h16a1.5 1.5 0 0 1 1.5 1.5v12a1.5 1.5 0 0 1-1.5 1.5H4A1.5 1.5 0 0 1 2.5 18V6A1.5 1.5 0 0 1 4 4.5zM9 4.5v15"));

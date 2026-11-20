@@ -33,6 +33,7 @@ open .nsh/out/Pi.app
 - Discovers projects from pi's session store under `~/.pi/agent/sessions` on first launch, the home-directory project included.
 - Lets you add a project folder and toggle the last five chats of each project (`Show more` reveals the rest).
 - Remembers each project's expanded or collapsed sidebar state across launches.
+- Soft-archives chats without moving or changing pi's session files. Hover a chat and use its archive icon to hide it from the list; archiving the current chat opens a new blank chat in the same project.
 - Hover a project to reveal its new-chat action; right-click it to copy its path or remove it.
 - Opens a chat by reading its session file directly; `pi` starts on the first prompt and stays warm across switches (up to three chats, ten minutes idle), so a running turn keeps going when you switch away.
 - Pages older history in as you scroll up, and keeps the last eight visited chats in memory with a ten-minute freshness check.
@@ -44,9 +45,9 @@ open .nsh/out/Pi.app
 - Open the branch tree from the chat header to see every branch in the current session and switch the active leaf when pi is idle.
 - Shows the current project's checked-out Git branch in the composer when the project is inside a repository.
 - Collapses a finished turn's thinking and tool details automatically. Press the collapsed row to inspect them again.
-- Exposes the installed pi model catalog and each model's thinking levels from the composer, refreshing the catalog when the window regains focus.
+- Exposes the installed pi model catalog and each model's thinking levels from the composer, refreshing the catalog when the window regains focus. If pi has no provider configured, the selector shows a `No models` state instead of pi's internal `unknown` placeholder.
 
-Projects are stored by the nsh app under its own app storage. Removing a project from the sidebar does not delete pi session files.
+Projects and archived-chat state are stored by the nsh app under its own app storage. Removing a project or archiving a chat does not delete pi session files.
 
 ## Layout
 

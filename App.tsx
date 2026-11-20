@@ -30,6 +30,7 @@ import {
   cleanSessionTitle,
   discoverProjects,
   hasSessionBranches,
+  isUsableModel,
   loadCatalog,
   loadSessionHistory,
   normalizeThinkingLevel,
@@ -59,6 +60,7 @@ import { chooseWindowsFolder } from "./windowsFolderPicker";
 const PROJECTS_KEY = "pi-nsh.projects.v2";
 const SESSIONS_KEY = "pi-nsh.sessions.v1";
 const EXPANDED_PROJECTS_KEY = "pi-nsh.expanded-projects.v1";
+const ARCHIVED_SESSIONS_KEY = "pi-nsh.archived-sessions.v1";
 const VISIBLE_SESSIONS = 5;
 
 type ToolRun = {
@@ -414,6 +416,7 @@ function App() {
   const sessions = signal<Record<string, SessionInfo[]>>({});
   const sidebarOpen = signal(true);
   const expandedProjects = signal<Set<string>>(new Set());
+  const archivedSessions = signal<Set<string>>(new Set());
   const showAllSessions = signal<Set<string>>(new Set());
   const activeProject = signal<string | null>(null);
   const activeSession = signal<string | null>(null);
@@ -422,6 +425,7 @@ function App() {
   const draft = signal("");
   const inputHeight = signal(22);
   const models = signal<ModelInfo[]>([]);
+  const modelsLoaded = signal(false);
   const modelKey = signal<string | null>(null);
   const modelChosen = signal(false);
   const modelOpen = signal(false);
@@ -447,6 +451,7 @@ function App() {
   let addCardRef: ViewRef | undefined;
   let catalogLoading: Promise<void> | null = null;
   let expandedProjectsWrite = Promise.resolve();
+  let archivedSessionsWrite = Promise.resolve();
   let copiedTimer: ReturnType<typeof setTimeout> | null = null;
 
   let draftSequence = 0;
@@ -575,8 +580,26 @@ function App() {
     void persistExpandedProjects(next);
   };
 
+  const persistArchivedSessions = (list = archivedSessions()) => {
+    const value = JSON.stringify([...list]);
+    archivedSessionsWrite = archivedSessionsWrite
+      .catch(() => {})
+      .then(() => Storage.setItem(ARCHIVED_SESSIONS_KEY, value))
+      .catch((reason) => {
+        appError.set(`Could not save archived chats: ${errorText(reason)}`);
+      });
+  };
+
+  const setSessionArchived = (sessionPath: string, archived: boolean) => {
+    const current = archivedSessions();
+    if (current.has(sessionPath) === archived) return;
+    const next = withSetValue(current, sessionPath, archived);
+    archivedSessions.set(next);
+    void persistArchivedSessions(next);
+  };
+
   const applyModel = (model: ModelInfo | null | undefined, chat: ChatSession | null = null) => {
-    if (!model?.provider || !model.id) return;
+    if (!model || !isUsableModel(model)) return;
     const key = modelKeyOf(model);
     models.update((list) => (list.some((item) => modelKeyOf(item) === key) ? list : [...list, model]));
     if (chat) chat.modelKey = key;
@@ -609,7 +632,8 @@ function App() {
   const syncThinking = async (client: PiClient, chat: ChatSession) => {
     const state = await client.request<{ model?: ModelInfo; thinkingLevel?: string }>("get_state");
     applyModel(state?.model, chat);
-    const model = state?.model ?? models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+    const candidate = state?.model;
+    const model = candidate && isUsableModel(candidate) ? candidate : models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
     const levels = await readThinkingLevels(client, model);
     applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
   };
@@ -646,7 +670,8 @@ function App() {
     state: { model?: ModelInfo; thinkingLevel?: string } | undefined,
   ) => {
     applyModel(state?.model, chat);
-    const model = state?.model ?? models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+    const candidate = state?.model;
+    const model = candidate && isUsableModel(candidate) ? candidate : models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
     const levels = await readThinkingLevels(client, model);
     applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
   };
@@ -791,7 +816,7 @@ function App() {
       chat.loadedAt = Date.now();
       chat.mtimeMs = history.mtimeMs;
       chat.size = history.size;
-      if (!chat.modelKey && history.model) {
+      if (!chat.modelKey && history.model && isUsableModel(history.model)) {
         const key = `${history.model.provider}/${history.model.id}`;
         chat.modelKey = key;
         if (chat === activeChat()) modelKey.set(key);
@@ -1241,6 +1266,7 @@ function App() {
       return;
     }
     chat.projectPath = projectPath;
+    if (chat.path) setSessionArchived(chat.path, false);
 
     const requestedModel = modelChosen() ? currentModel() : null;
     const wasExisting = Boolean(chat.path);
@@ -1275,7 +1301,8 @@ function App() {
           }
         }
         applyModel(state?.model, chat);
-        const model = state?.model ?? models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+        const candidate = state?.model;
+        const model = candidate && isUsableModel(candidate) ? candidate : models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
         const levels = await readThinkingLevels(started, model);
         applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
         if (requestedModel && state?.model && modelKeyOf(requestedModel) !== modelKeyOf(state.model)) {
@@ -1388,6 +1415,7 @@ function App() {
       messageEdit.set(null);
       return;
     }
+    if (chat.path) setSessionArchived(chat.path, false);
 
     messageEdit.set({ ...edit, saving: true });
     setChatState(chat, { branchBusy: true, branchError: null });
@@ -1711,6 +1739,15 @@ function App() {
 
   const removeProject = async (projectPath: string) => {
     const next = projects().filter((project) => project.path !== projectPath);
+    const removedSessionPaths = new Set((sessions()[projectPath] ?? []).map((session) => session.path));
+    for (const chat of chats.values()) {
+      if (chat.projectPath === projectPath && chat.path) removedSessionPaths.add(chat.path);
+    }
+    const nextArchived = new Set([...archivedSessions()].filter((sessionPath) => !removedSessionPaths.has(sessionPath)));
+    if (nextArchived.size !== archivedSessions().size) {
+      archivedSessions.set(nextArchived);
+      void persistArchivedSessions(nextArchived);
+    }
     projects.set(next);
     setProjectExpanded(projectPath, false);
     sessions.update((current) => {
@@ -1764,6 +1801,18 @@ function App() {
       } catch {
         storedExpanded = null;
       }
+      let storedArchived: string[] = [];
+      try {
+        const raw = await Storage.getItem(ARCHIVED_SESSIONS_KEY);
+        if (raw !== null) {
+          const parsed = JSON.parse(raw) as unknown;
+          if (Array.isArray(parsed)) {
+            storedArchived = parsed.filter((sessionPath): sessionPath is string => typeof sessionPath === "string");
+          }
+        }
+      } catch {
+        storedArchived = [];
+      }
       let cachedSessions: Record<string, SessionInfo[]> = {};
       try {
         const storedSessions = await Storage.getItem(SESSIONS_KEY);
@@ -1779,6 +1828,7 @@ function App() {
       }
       projects.set(list);
       sessions.set(cachedSessions);
+      archivedSessions.set(new Set(storedArchived));
       if (list.length) {
         activeProject.set(list[0].path);
         const projectPaths = new Set(list.map((project) => project.path));
@@ -1797,11 +1847,13 @@ function App() {
 
   const loadModels = (force = false): Promise<void> => {
     if (catalogLoading) return catalogLoading;
-    if (!force && models().length) return Promise.resolve();
+    if (!force && modelsLoaded()) return Promise.resolve();
     const pending = (async () => {
+      piIssue.set(null);
       try {
         const catalog = await loadCatalog();
         models.set(catalog.models);
+        modelsLoaded.set(true);
         if (catalog.defaultModel && !modelKey()) {
           applyModel(catalog.defaultModel);
           const chat = activeChat();
@@ -1816,7 +1868,6 @@ function App() {
             thinkingLevels.set(catalog.thinkingLevels);
           }
         }
-        piIssue.set(null);
       } catch (reason) {
         piIssue.set(errorText(reason));
       }
@@ -1832,7 +1883,7 @@ function App() {
 
   void boot();
   // The catalog needs its own pi process; let the first chat open first.
-  const catalogTimer = setTimeout(() => void loadModels(), 1500);
+  void loadModels();
   const poolTimer = setInterval(evictClients, 60_000);
   let gitBranchRequest = 0;
 
@@ -1849,7 +1900,6 @@ function App() {
 
   cleanup(() => {
     for (const chat of chats.values()) closeChatClient(chat);
-    clearTimeout(catalogTimer);
     clearInterval(poolTimer);
     if (copiedTimer) clearTimeout(copiedTimer);
   });
@@ -1887,11 +1937,88 @@ function App() {
 
   cleanup(keymap.bind("mod+b", () => sidebarOpen.set(!sidebarOpen()), { when: "always" }));
 
+  function SessionRow(props: { projectPath: () => string; session: () => SessionInfo }) {
+    const projectPath = props.projectPath;
+    const session = props.session;
+    const selected = computed(() => activeSession() === session().path);
+    const busy = computed(() => {
+      chatActivity();
+      return chats.get(session().path)?.state.running ?? false;
+    });
+    const hovering = signal(false);
+
+    return (
+      <View
+        onMouseEnter={() => hovering.set(true)}
+        onMouseLeave={() => hovering.set(false)}
+        style={{
+          height: 28,
+          marginLeft: 4,
+          borderRadius: 7,
+          flexDirection: "row",
+          alignItems: "center",
+          backgroundColor: selected() || hovering() ? colors.sidebarAccent : "transparent",
+        }}
+      >
+        <Press
+          onPress={() => void openExistingSession(projectPath(), session().path)}
+          hoverStyle={{ backgroundColor: "transparent" }}
+          style={{ flex: 1, minWidth: 0, height: 28, paddingLeft: 27, paddingRight: 3, justifyContent: "center" }}
+          accessibilityLabel={session().title}
+          accessibilityState={{ selected: selected() }}
+        >
+          <View style={{ width: "100%", flexDirection: "row", alignItems: "center", gap: 6 }}>
+            <Text
+              style={{
+                flex: 1,
+                minWidth: 0,
+                numberOfLines: 1,
+                textOverflow: "ellipsis",
+                fontSize: 12.5,
+                color: selected() ? colors.text : colors.mutedText,
+                fontWeight: selected() ? "500" : "400",
+              }}
+            >
+              {session().title}
+            </Text>
+            <If when={busy()}>
+              <Spinner size={10} tint={colors.faint} />
+            </If>
+          </View>
+        </Press>
+        <View
+          style={{
+            width: 26,
+            height: 28,
+            alignItems: "center",
+            justifyContent: "center",
+            opacity: hovering() ? 1 : 0,
+            pointerEvents: hovering() ? "auto" : "none",
+          }}
+        >
+          <Press
+            onPress={() => {
+              const archiveCurrent = selected();
+              setSessionArchived(session().path, true);
+              if (archiveCurrent) newChat(projectPath());
+            }}
+            disabled={!hovering()}
+            style={{ width: 24, height: 24, borderRadius: 6, alignItems: "center", justifyContent: "center" }}
+            tooltip={<Text style={{ fontSize: 12 }}>Archive</Text>}
+            accessibilityLabel={`Archive ${session().title}`}
+          >
+            <Icon name="archive" size={13} tint={colors.mutedText} />
+          </Press>
+        </View>
+      </View>
+    );
+  }
+
   function ProjectRow(props: { project: () => ProjectInfo }) {
     const project = props.project;
     const projectPath = computed(() => project().path);
     const open = computed(() => expandedProjects().has(projectPath()));
-    const projectSessions = computed(() => sessions()[projectPath()] ?? []);
+    const projectSessions = computed(() => (sessions()[projectPath()] ?? []).filter((session) => !archivedSessions().has(session.path)));
     const all = computed(() => showAllSessions().has(projectPath()));
     const visible = computed(() => (all() ? projectSessions() : projectSessions().slice(0, VISIBLE_SESSIONS)));
     const isActive = computed(() => activeProject() === projectPath() && !activeSession());
@@ -1959,53 +2086,11 @@ function App() {
           <View style={{ paddingBottom: 4 }}>
             <If when={projectSessions().length === 0}>
               <View style={{ height: 27, paddingLeft: 30, justifyContent: "center" }}>
-                <Text style={{ fontSize: 12, color: colors.faint }}>No chats</Text>
+                <Text style={{ fontSize: 12, color: colors.faint }}>No active chats</Text>
               </View>
             </If>
             <Each of={visible()}>
-              {(session) => {
-                const busy = computed(() => {
-                  chatActivity();
-                  return chats.get(session().path)?.state.running ?? false;
-                });
-                return (
-                  <Press
-                    onPress={() => void openExistingSession(projectPath(), session().path)}
-                    hoverStyle={{ backgroundColor: colors.sidebarAccent }}
-                    style={{
-                      height: 28,
-                      marginLeft: 4,
-                      borderRadius: 7,
-                      paddingLeft: 27,
-                      paddingRight: 8,
-                      alignItems: "flex-start",
-                      justifyContent: "center",
-                      backgroundColor: activeSession() === session().path ? colors.sidebarAccent : "transparent",
-                    }}
-                    accessibilityLabel={session().title}
-                    accessibilityState={{ selected: activeSession() === session().path }}
-                  >
-                    <View style={{ width: "100%", flexDirection: "row", alignItems: "center", gap: 6 }}>
-                      <Text
-                        style={{
-                          flex: 1,
-                          minWidth: 0,
-                          numberOfLines: 1,
-                          textOverflow: "ellipsis",
-                          fontSize: 12.5,
-                          color: activeSession() === session().path ? colors.text : colors.mutedText,
-                          fontWeight: activeSession() === session().path ? "500" : "400",
-                        }}
-                      >
-                        {session().title}
-                      </Text>
-                      <If when={busy()}>
-                        <Spinner size={10} tint={colors.faint} />
-                      </If>
-                    </View>
-                  </Press>
-                );
-              }}
+              {(session) => <SessionRow projectPath={projectPath} session={session} />}
             </Each>
             <If when={projectSessions().length > VISIBLE_SESSIONS}>
               <Press
@@ -2773,6 +2858,11 @@ function App() {
 
   function ModelPicker() {
     const title = computed(() => {
+      if (!models().length) {
+        if (piIssue()) return "Models unavailable";
+        if (!modelsLoaded()) return "Loading models…";
+        return "No models";
+      }
       const model = currentModel();
       return model?.name || model?.id || "Choose model";
     });
@@ -2797,7 +2887,7 @@ function App() {
             hoverStyle={{ backgroundColor: colors.accent }}
           >
             <Text style={{ numberOfLines: 1, textOverflow: "ellipsis", flexShrink: 1, fontSize: 11.5, color: colors.mutedText }}>
-              {models().length ? title() : "pi model"}
+              {title()}
             </Text>
             <Icon name="chevron-down" size={12} tint={colors.faint} />
           </View>
@@ -2806,10 +2896,13 @@ function App() {
         <View style={{ width: 280 }}>
           <Scroll style={{ maxHeight: 372, flexShrink: 1 }} contentStyle={{ padding: 4 }} scrollbar>
             <If when={models().length === 0}>
-              <View style={{ height: 32, paddingHorizontal: 8, justifyContent: "center" }}>
+              <View style={{ paddingHorizontal: 8, paddingVertical: 7, gap: 3 }}>
                 <Text style={{ fontSize: 12, numberOfLines: 1, textOverflow: "ellipsis", color: colors.faint }}>
-                  {piIssue() ? oneLine(piIssue() ?? "", 60) : "Loading models…"}
+                  {piIssue() ? oneLine(piIssue() ?? "", 60) : modelsLoaded() ? "No models available" : "Loading models…"}
                 </Text>
+                <If when={modelsLoaded() && !piIssue()}>
+                  <Text style={{ fontSize: 11.5, lineHeight: 16, color: colors.faint }}>Configure a provider in pi with /login.</Text>
+                </If>
               </View>
             </If>
             <Each of={modelGroups()}>

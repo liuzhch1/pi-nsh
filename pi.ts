@@ -15,6 +15,12 @@ export interface ModelInfo {
   thinkingLevelMap?: Record<string, string | null>;
 }
 
+export function isUsableModel(model: { provider?: unknown; id?: unknown } | null | undefined): boolean {
+  const provider = typeof model?.provider === "string" ? model.provider.trim().toLowerCase() : "";
+  const id = typeof model?.id === "string" ? model.id.trim().toLowerCase() : "";
+  return Boolean(provider && id && provider !== "unknown" && id !== "unknown");
+}
+
 export interface SessionInfo {
   path: string;
   title: string;
@@ -1048,8 +1054,9 @@ export async function loadCatalog(): Promise<{
       client.request<{ model?: ModelInfo; thinkingLevel?: string }>("get_state"),
       client.request<{ models?: ModelInfo[] }>("get_available_models"),
     ]);
-    const models = Array.isArray(available?.models) ? available.models : [];
-    const defaultModel = state?.model ?? models[0] ?? null;
+    const models = Array.isArray(available?.models) ? available.models.filter((model) => isUsableModel(model)) : [];
+    const candidate = state?.model;
+    const defaultModel = candidate && isUsableModel(candidate) ? candidate : models[0] ?? null;
     const thinking = await client
       .request<{ levels?: string[] }>("get_available_thinking_levels")
       .catch(() => ({ levels: [] as string[] }));
