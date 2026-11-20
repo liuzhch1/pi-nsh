@@ -1052,7 +1052,7 @@ export async function loadCatalog(): Promise<{
     await client.start();
     const [state, available] = await Promise.all([
       client.request<{ model?: ModelInfo; thinkingLevel?: string }>("get_state"),
-      client.request<{ models?: ModelInfo[] }>("get_available_models"),
+      client.request<{ models?: ModelInfo[] }>("get_available_models").catch(() => ({ models: [] as ModelInfo[] })),
     ]);
     const models = Array.isArray(available?.models) ? available.models.filter((model) => isUsableModel(model)) : [];
     const candidate = state?.model;
@@ -1067,8 +1067,6 @@ export async function loadCatalog(): Promise<{
       thinkingLevel: normalizeThinkingLevel(state?.thinkingLevel),
       thinkingLevels: thinkingLevels.length ? thinkingLevels : supportedThinkingLevels(defaultModel),
     };
-  } catch (error) {
-    throw error instanceof Error ? error : new Error(String(error));
   } finally {
     client.close();
   }

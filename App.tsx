@@ -95,6 +95,8 @@ type MessageEdit = {
   saving: boolean;
 };
 
+type PickerName = "model" | "thinking" | "branch";
+
 type ChatSession = {
   id: string;
   path: string | null;
@@ -183,6 +185,37 @@ function modelMatchesKey(model: ModelInfo, key: string | null): boolean {
   if (modelKeyOf(model) === key) return true;
   // A resumed session can name an older provider alias for a catalog model.
   return model.id === key.slice(key.indexOf("/") + 1);
+}
+
+function PickerOption(props: { label: string; selected: boolean; accessibilityLabel?: string; onPress: () => void }) {
+  return (
+    <View
+      onPress={props.onPress}
+      role="button"
+      accessibilityLabel={props.accessibilityLabel ?? props.label}
+      accessibilityState={{ selected: props.selected }}
+      hoverStyle={{ backgroundColor: colors.accent }}
+      activeStyle={{ opacity: 0.75 }}
+      style={{ height: 28, borderRadius: 6, paddingHorizontal: 6, flexDirection: "row", alignItems: "center", gap: 8 }}
+    >
+      <Text
+        style={{
+          flex: 1,
+          minWidth: 0,
+          numberOfLines: 1,
+          textOverflow: "ellipsis",
+          fontSize: 12.5,
+          color: colors.text,
+          fontWeight: props.selected ? "500" : "400",
+        }}
+      >
+        {props.label}
+      </Text>
+      <If when={props.selected}>
+        <Icon name="check" size={12} tint={colors.text} />
+      </If>
+    </View>
+  );
 }
 
 function textOfContent(content: unknown): string {
@@ -428,13 +461,11 @@ function App() {
   const modelsLoaded = signal(false);
   const modelKey = signal<string | null>(null);
   const modelChosen = signal(false);
-  const modelOpen = signal(false);
   const thinkingLevel = signal<ThinkingLevel | null>(null);
   const thinkingLevels = signal<ThinkingLevel[]>([]);
   const thinkingChosen = signal(false);
-  const thinkingOpen = signal(false);
   const gitBranch = signal<string | null>(null);
-  const branchOpen = signal(false);
+  const openPicker = signal<PickerName | null>(null);
   const forkingTurnId = signal<string | null>(null);
   const messageEdit = signal<MessageEdit | null>(null);
   const editHeight = signal(48);
@@ -450,13 +481,16 @@ function App() {
   let composerInput: InputRef | undefined;
   let addCardRef: ViewRef | undefined;
   let catalogLoading: Promise<void> | null = null;
-  let expandedProjectsWrite = Promise.resolve();
-  let archivedSessionsWrite = Promise.resolve();
+  const storageWrites = new Map<string, Promise<void>>();
   let copiedTimer: ReturnType<typeof setTimeout> | null = null;
 
   let draftSequence = 0;
   const chats = new Map<string, ChatSession>();
   const blankChat = createChatSession("", null, null);
+
+  const setPickerOpen = (picker: PickerName, open: boolean) => {
+    openPicker.update((current) => (open ? picker : current === picker ? null : current));
+  };
 
   const activeChat = (): ChatSession => {
     const id = activeSession() ?? draftChatId();
@@ -493,10 +527,15 @@ function App() {
   const branchError = computed(() => chatView().branchError);
   const sessionHasBranches = computed(() => hasSessionBranches(branchTree()));
 
+  const findModel = (key: string | null): ModelInfo | null => models().find((model) => modelMatchesKey(model, key)) ?? null;
+
+  const resolveModel = (candidate: ModelInfo | undefined, key: string | null): ModelInfo | null =>
+    candidate && isUsableModel(candidate) ? candidate : findModel(key);
+
   const currentModel = computed(() => {
     const key = modelKey();
     if (!key) return models()[0] ?? null;
-    return models().find((model) => modelMatchesKey(model, key)) ?? null;
+    return findModel(key);
   });
 
   const modelGroups = computed(() => {
@@ -554,22 +593,37 @@ function App() {
     if (!project || !session) return null;
     return (sessions()[project] ?? []).find((item) => item.path === session) ?? null;
   });
-  const persistProjects = async (list = projects()) => {
+
+  const persistJson = (key: string, value: unknown, onError?: (reason: unknown) => void): Promise<void> => {
+    const write = (storageWrites.get(key) ?? Promise.resolve())
+      .then(() => Storage.setItem(key, JSON.stringify(value)))
+      .catch((reason) => {
+        onError?.(reason);
+      });
+    storageWrites.set(key, write);
+    return write;
+  };
+
+  const readStringArray = async (key: string): Promise<string[] | null> => {
     try {
-      await Storage.setItem(PROJECTS_KEY, JSON.stringify(list));
-    } catch (reason) {
-      appError.set(`Could not save projects: ${errorText(reason)}`);
+      const raw = await Storage.getItem(key);
+      if (raw === null) return null;
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : null;
+    } catch {
+      return null;
     }
   };
 
+  const persistProjects = (list = projects()) => {
+    return persistJson(PROJECTS_KEY, list, (reason) => {
+      appError.set(`Could not save projects: ${errorText(reason)}`);
+    });
+  };
+
   const persistExpandedProjects = (list = expandedProjects()) => {
-    const value = JSON.stringify([...list]);
-    expandedProjectsWrite = expandedProjectsWrite
-      .catch(() => {})
-      .then(() => Storage.setItem(EXPANDED_PROJECTS_KEY, value))
-      .catch(() => {
-        // Folding still works for this session if the preference cannot be saved.
-      });
+    // Folding still works for this session if the preference cannot be saved.
+    void persistJson(EXPANDED_PROJECTS_KEY, [...list]);
   };
 
   const setProjectExpanded = (projectPath: string, open: boolean) => {
@@ -581,13 +635,9 @@ function App() {
   };
 
   const persistArchivedSessions = (list = archivedSessions()) => {
-    const value = JSON.stringify([...list]);
-    archivedSessionsWrite = archivedSessionsWrite
-      .catch(() => {})
-      .then(() => Storage.setItem(ARCHIVED_SESSIONS_KEY, value))
-      .catch((reason) => {
-        appError.set(`Could not save archived chats: ${errorText(reason)}`);
-      });
+    void persistJson(ARCHIVED_SESSIONS_KEY, [...list], (reason) => {
+      appError.set(`Could not save archived chats: ${errorText(reason)}`);
+    });
   };
 
   const setSessionArchived = (sessionPath: string, archived: boolean) => {
@@ -596,6 +646,30 @@ function App() {
     const next = withSetValue(current, sessionPath, archived);
     archivedSessions.set(next);
     void persistArchivedSessions(next);
+  };
+
+  const persistSessions = (list = sessions()) => persistJson(SESSIONS_KEY, list);
+
+  const setSessions = (next: Record<string, SessionInfo[]>) => {
+    sessions.set(next);
+    void persistSessions(next);
+  };
+
+  const replaceProjectSessions = (projectPath: string, list: SessionInfo[]) => {
+    setSessions({ ...sessions(), [projectPath]: list });
+  };
+
+  const patchSession = (projectPath: string, sessionPath: string, patch: Partial<SessionInfo>) => {
+    replaceProjectSessions(
+      projectPath,
+      (sessions()[projectPath] ?? []).map((session) => (session.path === sessionPath ? { ...session, ...patch } : session)),
+    );
+  };
+
+  const removeProjectSessions = (projectPath: string) => {
+    const next = { ...sessions() };
+    delete next[projectPath];
+    setSessions(next);
   };
 
   const applyModel = (model: ModelInfo | null | undefined, chat: ChatSession | null = null) => {
@@ -629,13 +703,20 @@ function App() {
     }
   };
 
-  const syncThinking = async (client: PiClient, chat: ChatSession) => {
-    const state = await client.request<{ model?: ModelInfo; thinkingLevel?: string }>("get_state");
+  const applyClientState = async (
+    client: PiClient,
+    chat: ChatSession,
+    state: { model?: ModelInfo; thinkingLevel?: string } | undefined,
+  ) => {
     applyModel(state?.model, chat);
-    const candidate = state?.model;
-    const model = candidate && isUsableModel(candidate) ? candidate : models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+    const model = resolveModel(state?.model, chat.modelKey);
     const levels = await readThinkingLevels(client, model);
     applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
+  };
+
+  const syncThinking = async (client: PiClient, chat: ChatSession) => {
+    const state = await client.request<{ model?: ModelInfo; thinkingLevel?: string }>("get_state");
+    await applyClientState(client, chat, state);
   };
 
   const refreshBranchTree = async (client: PiClient, chat: ChatSession) => {
@@ -664,21 +745,9 @@ function App() {
     };
   };
 
-  const applyContextSettings = async (
-    client: PiClient,
-    chat: ChatSession,
-    state: { model?: ModelInfo; thinkingLevel?: string } | undefined,
-  ) => {
-    applyModel(state?.model, chat);
-    const candidate = state?.model;
-    const model = candidate && isUsableModel(candidate) ? candidate : models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
-    const levels = await readThinkingLevels(client, model);
-    applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
-  };
-
   const loadChatContext = async (client: PiClient, chat: ChatSession) => {
     const { state, history, tree, leafId } = await readChatContext(client);
-    await applyContextSettings(client, chat, state);
+    await applyClientState(client, chat, state);
     setChatState(chat, {
       messages: history,
       collapsed: collapsedTurnsOf(history),
@@ -714,7 +783,7 @@ function App() {
   const refreshProject = async (projectPath: string) => {
     try {
       const list = await scanProjectSessions(projectPath);
-      sessions.update((current) => ({ ...current, [projectPath]: list }));
+      replaceProjectSessions(projectPath, list);
     } catch {
       // Keep what is already shown.
     }
@@ -734,10 +803,10 @@ function App() {
       void refreshProject(projectPath);
       return;
     }
-    sessions.update((current) => ({
-      ...current,
-      [projectPath]: [{ ...existing, modified: Date.now() }, ...list.filter((item) => item.path !== sessionPath)],
-    }));
+    replaceProjectSessions(projectPath, [
+      { ...existing, modified: Date.now() },
+      ...list.filter((item) => item.path !== sessionPath),
+    ]);
   };
 
   const trimChatStates = () => {
@@ -774,7 +843,7 @@ function App() {
       const started = chat.client ?? (await ensureClient(chat));
       const { state, history, tree, leafId } = await readChatContext(started);
       if (token !== undefined && token !== chat.loadToken) return;
-      await applyContextSettings(started, chat, state);
+      await applyClientState(started, chat, state);
       setChatState(chat, {
         messages: history,
         collapsed: collapsedTurnsOf(history),
@@ -826,7 +895,7 @@ function App() {
         if (chat === activeChat()) thinkingLevel.set(history.thinkingLevel);
       }
       if (!chat.thinkingLevels.length) {
-        const model = models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+        const model = findModel(chat.modelKey);
         chat.thinkingLevels = supportedThinkingLevels(model);
         if (chat === activeChat()) thinkingLevels.set(chat.thinkingLevels);
       }
@@ -865,6 +934,12 @@ function App() {
     chat.lastUsed = Date.now();
     const set = (patch: Partial<ChatState>) => setChatState(chat, patch);
     const updateMessages = (fn: (list: PiMessage[]) => PiMessage[]) => set({ messages: fn(chat.state.messages) });
+    const updateToolRun = (idValue: unknown, update: (run: ToolRun | undefined) => ToolRun) => {
+      const id = String(idValue ?? "");
+      if (!id) return;
+      const runs = chat.state.toolRuns;
+      set({ toolRuns: { ...runs, [id]: update(runs[id]) } });
+    };
 
     switch (event.type) {
       case "agent_start":
@@ -960,42 +1035,31 @@ function App() {
         break;
       }
       case "tool_execution_start": {
-        const id = String(event.toolCallId ?? "");
-        if (!id) break;
-        const runs = chat.state.toolRuns;
-        set({
-          toolRuns: {
-            ...runs,
-            [id]: { ...runs[id], args: (event.args as Record<string, unknown> | undefined) ?? runs[id]?.args, running: true },
-          },
-        });
+        updateToolRun(event.toolCallId, (run) => ({
+          ...run,
+          args: (event.args as Record<string, unknown> | undefined) ?? run?.args,
+          running: true,
+        }));
         break;
       }
       case "tool_execution_update": {
-        const id = String(event.toolCallId ?? "");
-        if (!id) break;
         const partial = event.partialResult as { content?: unknown } | undefined;
-        const runs = chat.state.toolRuns;
-        set({ toolRuns: { ...runs, [id]: { ...runs[id], running: true, result: textOfContent(partial?.content) } } });
+        updateToolRun(event.toolCallId, (run) => ({
+          ...run,
+          running: true,
+          result: textOfContent(partial?.content),
+        }));
         break;
       }
       case "tool_execution_end": {
-        const id = String(event.toolCallId ?? "");
-        if (!id) break;
         const result = event.result as { content?: unknown } | undefined;
-        const runs = chat.state.toolRuns;
-        set({
-          toolRuns: {
-            ...runs,
-            [id]: {
-              ...runs[id],
-              running: false,
-              result: textOfContent(result?.content),
-              isError: event.isError === true,
-              durationMs: typeof event.durationMs === "number" ? event.durationMs : undefined,
-            },
-          },
-        });
+        updateToolRun(event.toolCallId, (run) => ({
+          ...run,
+          running: false,
+          result: textOfContent(result?.content),
+          isError: event.isError === true,
+          durationMs: typeof event.durationMs === "number" ? event.durationMs : undefined,
+        }));
         break;
       }
       case "agent_settled": {
@@ -1043,10 +1107,7 @@ function App() {
           break;
         }
         const title = cleanSessionTitle(name);
-        sessions.update((current) => ({
-          ...current,
-          [projectPath]: (current[projectPath] ?? []).map((item) => (item.path === sessionPath ? { ...item, title } : item)),
-        }));
+        patchSession(projectPath, sessionPath, { title });
         break;
       }
       default:
@@ -1147,10 +1208,10 @@ function App() {
     chat.lastUsed = Date.now();
     messageEdit.set(null);
     editHeight.set(48);
-    branchOpen.set(false);
+    openPicker.set(null);
     modelKey.set(chat.modelKey);
     modelChosen.set(chat.modelChosen);
-    const model = models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
+    const model = findModel(chat.modelKey);
     if (!chat.thinkingLevels.length) chat.thinkingLevels = supportedThinkingLevels(model);
     thinkingLevel.set(chat.thinkingLevel);
     thinkingLevels.set(chat.thinkingLevels);
@@ -1170,6 +1231,21 @@ function App() {
     chat.thinkingChosen = thinkingChosen();
   };
 
+  const discardEmptyDraft = () => {
+    rememberActiveModel();
+    const previous = activeChat();
+    if (
+      previous !== blankChat &&
+      !previous.path &&
+      !previous.client &&
+      !previous.clientReady &&
+      previous.state.messages.length === 0 &&
+      chats.get(previous.id) === previous
+    ) {
+      chats.delete(previous.id);
+    }
+  };
+
   const adoptSessionPath = (chat: ChatSession, sessionPath: string) => {
     if (chat.path === sessionPath) return;
     const wasActive = activeChat() === chat;
@@ -1187,27 +1263,12 @@ function App() {
   const refreshMany = async (list: ProjectInfo[]) => {
     const next = await scanAllProjects(list);
     sessions.set(next);
-    try {
-      await Storage.setItem(SESSIONS_KEY, JSON.stringify(next));
-    } catch {
-      // The sidebar still works without the cache.
-    }
+    await persistSessions(next);
   };
 
   const openExistingSession = (projectPath: string, sessionPath: string) => {
     if (activeProject() === projectPath && activeSession() === sessionPath) return;
-    rememberActiveModel();
-    const previous = activeChat();
-    if (
-      previous !== blankChat &&
-      !previous.path &&
-      !previous.client &&
-      !previous.clientReady &&
-      previous.state.messages.length === 0 &&
-      chats.get(previous.id) === previous
-    ) {
-      chats.delete(previous.id);
-    }
+    discardEmptyDraft();
     const chat = ensureChat(sessionPath, projectPath, sessionPath);
     activeProject.set(projectPath);
     activeSession.set(sessionPath);
@@ -1217,20 +1278,9 @@ function App() {
   };
 
   const newChat = (projectPath?: string | null) => {
-    rememberActiveModel();
+    discardEmptyDraft();
     messageEdit.set(null);
     editHeight.set(48);
-    const previous = activeChat();
-    if (
-      previous !== blankChat &&
-      !previous.path &&
-      !previous.client &&
-      !previous.clientReady &&
-      previous.state.messages.length === 0 &&
-      chats.get(previous.id) === previous
-    ) {
-      chats.delete(previous.id);
-    }
     const id = `draft:${++draftSequence}`;
     const chat = createChatSession(id, projectPath ?? activeProject(), null);
     chat.modelKey = modelKey();
@@ -1245,9 +1295,7 @@ function App() {
       setProjectExpanded(projectPath, true);
     }
     activeSession.set(null);
-    modelOpen.set(false);
-    thinkingOpen.set(false);
-    branchOpen.set(false);
+    openPicker.set(null);
     evictClients();
   };
 
@@ -1257,9 +1305,7 @@ function App() {
     if (activeChat() === blankChat) newChat();
     const chat = activeChat();
     if (chat.state.running) return;
-    modelOpen.set(false);
-    thinkingOpen.set(false);
-    branchOpen.set(false);
+    openPicker.set(null);
     const projectPath = chat.projectPath ?? activeProject();
     if (!projectPath) {
       addOpen.set(true);
@@ -1300,11 +1346,7 @@ function App() {
             chat.loadedAt = Date.now();
           }
         }
-        applyModel(state?.model, chat);
-        const candidate = state?.model;
-        const model = candidate && isUsableModel(candidate) ? candidate : models().find((item) => modelMatchesKey(item, chat.modelKey)) ?? null;
-        const levels = await readThinkingLevels(started, model);
-        applyThinking(chat, normalizeThinkingLevel(state?.thinkingLevel), levels, model);
+        await applyClientState(started, chat, state);
         if (requestedModel && state?.model && modelKeyOf(requestedModel) !== modelKeyOf(state.model)) {
           await started.request("set_model", { provider: requestedModel.provider, modelId: requestedModel.id });
           await syncThinking(started, chat);
@@ -1494,7 +1536,7 @@ function App() {
     const chat = activeChat();
     if (chat === blankChat || !chat.path || chat.state.running || chat.state.loading || chat.state.branchBusy) return;
     if (leafId === chat.state.branchLeafId) {
-      branchOpen.set(false);
+      openPicker.set(null);
       return;
     }
     setChatState(chat, { branchBusy: true, branchError: null });
@@ -1502,7 +1544,7 @@ function App() {
       const client = chat.client ?? (await ensureClient(chat));
       await navigateTreeTarget(client, leafId);
       await loadChatContext(client, chat);
-      branchOpen.set(false);
+      openPicker.set(null);
     } catch (reason) {
       setChatState(chat, { branchBusy: false, branchError: errorText(reason) });
     }
@@ -1555,13 +1597,10 @@ function App() {
       adoptSessionPath(chat, nextSessionFile);
       if (projectPath) {
         const now = Date.now();
-        sessions.update((current) => ({
-          ...current,
-          [projectPath]: [
-            { path: nextSessionFile, title: forkTitle, modified: now, mtimeMs: now },
-            ...(current[projectPath] ?? []).filter((session) => session.path !== nextSessionFile),
-          ],
-        }));
+        replaceProjectSessions(projectPath, [
+          { path: nextSessionFile, title: forkTitle, modified: now, mtimeMs: now },
+          ...(sessions()[projectPath] ?? []).filter((session) => session.path !== nextSessionFile),
+        ]);
       }
       chat.pendingUserId = null;
       chat.liveAssistantId = null;
@@ -1605,7 +1644,7 @@ function App() {
     const previousKey = modelKey();
     const previousLevel = chat.thinkingLevel;
     const previousLevels = chat.thinkingLevels;
-    const previousModel = models().find((item) => modelMatchesKey(item, previousKey)) ?? null;
+    const previousModel = findModel(previousKey);
     modelKey.set(value);
     modelChosen.set(true);
     chat.modelKey = value;
@@ -1750,11 +1789,7 @@ function App() {
     }
     projects.set(next);
     setProjectExpanded(projectPath, false);
-    sessions.update((current) => {
-      const copy = { ...current };
-      delete copy[projectPath];
-      return copy;
-    });
+    removeProjectSessions(projectPath);
     await persistProjects(next);
     for (const chat of [...chats.values()]) {
       if (chat.projectPath !== projectPath) continue;
@@ -1765,9 +1800,7 @@ function App() {
       activeProject.set(null);
       activeSession.set(null);
       draftChatId.set(null);
-      modelOpen.set(false);
-      thinkingOpen.set(false);
-      branchOpen.set(false);
+      openPicker.set(null);
       messageEdit.set(null);
       draft.set("");
       inputHeight.set(22);
@@ -1787,32 +1820,10 @@ function App() {
         }
       } else {
         list = await discoverProjects();
-        await Storage.setItem(PROJECTS_KEY, JSON.stringify(list));
+        await persistProjects(list);
       }
-      let storedExpanded: string[] | null = null;
-      try {
-        const raw = await Storage.getItem(EXPANDED_PROJECTS_KEY);
-        if (raw !== null) {
-          const parsed = JSON.parse(raw) as unknown;
-          if (Array.isArray(parsed)) {
-            storedExpanded = parsed.filter((path): path is string => typeof path === "string");
-          }
-        }
-      } catch {
-        storedExpanded = null;
-      }
-      let storedArchived: string[] = [];
-      try {
-        const raw = await Storage.getItem(ARCHIVED_SESSIONS_KEY);
-        if (raw !== null) {
-          const parsed = JSON.parse(raw) as unknown;
-          if (Array.isArray(parsed)) {
-            storedArchived = parsed.filter((sessionPath): sessionPath is string => typeof sessionPath === "string");
-          }
-        }
-      } catch {
-        storedArchived = [];
-      }
+      const storedExpanded = await readStringArray(EXPANDED_PROJECTS_KEY);
+      const storedArchived = (await readStringArray(ARCHIVED_SESSIONS_KEY)) ?? [];
       let cachedSessions: Record<string, SessionInfo[]> = {};
       try {
         const storedSessions = await Storage.getItem(SESSIONS_KEY);
@@ -1882,7 +1893,7 @@ function App() {
   };
 
   void boot();
-  // The catalog needs its own pi process; let the first chat open first.
+  // The catalog uses its own pi process and loads independently of the first chat.
   void loadModels();
   const poolTimer = setInterval(evictClients, 60_000);
   let gitBranchRequest = 0;
@@ -1909,7 +1920,8 @@ function App() {
   });
 
   effect(() => {
-    if (modelOpen() || thinkingOpen()) void loadModels();
+    const picker = openPicker();
+    if (picker === "model" || picker === "thinking") void loadModels();
   });
 
   effect(() => {
@@ -2785,14 +2797,8 @@ function App() {
     });
     return (
       <Popover
-        open={branchOpen()}
-        onOpenChange={({ open }) => {
-          branchOpen.set(open);
-          if (open) {
-            modelOpen.set(false);
-            thinkingOpen.set(false);
-          }
-        }}
+        open={openPicker() === "branch"}
+        onOpenChange={({ open }) => setPickerOpen("branch", open)}
         placement="bottom"
         align="end"
         offset={6}
@@ -2802,7 +2808,7 @@ function App() {
           <View
             role="button"
             accessibilityLabel="Session branches"
-            accessibilityState={{ expanded: branchOpen() }}
+            accessibilityState={{ expanded: openPicker() === "branch" }}
             style={{ height: 28, flexShrink: 0, borderRadius: 7, paddingHorizontal: 8, flexDirection: "row", alignItems: "center", gap: 5 }}
             hoverStyle={{ backgroundColor: colors.accent }}
           >
@@ -2868,14 +2874,8 @@ function App() {
     });
     return (
       <Popover
-        open={modelOpen()}
-        onOpenChange={({ open }) => {
-          modelOpen.set(open);
-          if (open) {
-            thinkingOpen.set(false);
-            branchOpen.set(false);
-          }
-        }}
+        open={openPicker() === "model"}
+        onOpenChange={({ open }) => setPickerOpen("model", open)}
         placement="top"
         align="start"
         offset={6}
@@ -2913,24 +2913,15 @@ function App() {
                   </View>
                   <Each of={group().models}>
                     {(model) => (
-                      <View
+                      <PickerOption
+                        label={model().name || model().id}
+                        selected={modelMatchesKey(model(), modelKey())}
+                        accessibilityLabel={`Use ${model().name || model().id}`}
                         onPress={() => {
                           void chooseModel(modelKeyOf(model()));
-                          modelOpen.set(false);
+                          openPicker.set(null);
                         }}
-                        role="button"
-                        accessibilityLabel={`Use ${model().name || model().id}`}
-                        hoverStyle={{ backgroundColor: colors.accent }}
-                        activeStyle={{ opacity: 0.75 }}
-                        style={{ height: 28, borderRadius: 6, paddingHorizontal: 6, flexDirection: "row", alignItems: "center", gap: 8 }}
-                      >
-                        <Text style={{ flex: 1, numberOfLines: 1, textOverflow: "ellipsis", fontSize: 12.5, color: colors.text, fontWeight: modelMatchesKey(model(), modelKey()) ? "500" : "400" }}>
-                          {model().name || model().id}
-                        </Text>
-                        <If when={modelMatchesKey(model(), modelKey())}>
-                          <Icon name="check" size={12} tint={colors.text} />
-                        </If>
-                      </View>
+                      />
                     )}
                   </Each>
                 </View>
@@ -2946,14 +2937,8 @@ function App() {
     const title = computed(() => thinkingLevel() ?? "thinking");
     return (
       <Popover
-        open={thinkingOpen()}
-        onOpenChange={({ open }) => {
-          thinkingOpen.set(open);
-          if (open) {
-            modelOpen.set(false);
-            branchOpen.set(false);
-          }
-        }}
+        open={openPicker() === "thinking"}
+        onOpenChange={({ open }) => setPickerOpen("thinking", open)}
         placement="top"
         align="start"
         offset={6}
@@ -2980,24 +2965,15 @@ function App() {
             </View>
             <Each of={thinkingOptions()}>
               {(level) => (
-                <View
+                <PickerOption
+                  label={level()}
+                  selected={thinkingLevel() === level()}
+                  accessibilityLabel={`Use ${level()} thinking`}
                   onPress={() => {
                     void chooseThinking(level());
-                    thinkingOpen.set(false);
+                    openPicker.set(null);
                   }}
-                  role="button"
-                  accessibilityLabel={`Use ${level()} thinking`}
-                  hoverStyle={{ backgroundColor: colors.accent }}
-                  activeStyle={{ opacity: 0.75 }}
-                  style={{ height: 28, borderRadius: 6, paddingHorizontal: 6, flexDirection: "row", alignItems: "center", gap: 8 }}
-                >
-                  <Text style={{ flex: 1, fontSize: 12.5, color: colors.text, fontWeight: thinkingLevel() === level() ? "500" : "400" }}>
-                    {level()}
-                  </Text>
-                  <If when={thinkingLevel() === level()}>
-                    <Icon name="check" size={12} tint={colors.text} />
-                  </If>
-                </View>
+                />
               )}
             </Each>
           </Scroll>
@@ -3041,9 +3017,7 @@ function App() {
                 autoFocus
                 scrollbar={false}
                 onFocus={() => {
-                  modelOpen.set(false);
-                  thinkingOpen.set(false);
-                  branchOpen.set(false);
+                  openPicker.set(null);
                 }}
                 placeholder={placeholder()}
                 submitBehavior="submit"
@@ -3061,12 +3035,10 @@ function App() {
                 }}
                 accessibilityLabel="Message pi"
               />
-              <If when={modelOpen() || thinkingOpen() || branchOpen()}>
+              <If when={openPicker() !== null}>
                 <View
                   onPress={() => {
-                    modelOpen.set(false);
-                    thinkingOpen.set(false);
-                    branchOpen.set(false);
+                    openPicker.set(null);
                     composerInput?.focus();
                   }}
                   style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}
